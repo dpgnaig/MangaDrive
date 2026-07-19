@@ -89,10 +89,11 @@ Root (share cho Service Account, quyền Viewer)
 
 ## Scramble ảnh (chống leech)
 
-Ảnh trên Drive được **xáo trộn ô** (scramble grid NxN) bằng WPF tool ngoài repo. Frontend **unscramble ở client** bằng canvas.
-- Backend chỉ trả bit `isScrambled` (`Scramble:Enabled`), **không bao giờ lộ key**.
-- Key + grid nằm ở frontend build-time env: `VITE_SCRAMBLE_KEY`, `VITE_SCRAMBLE_GRID` (mặc định 6). **Phải khớp với WPF tool đã scramble.**
-- Thuật toán ở `components/UnscrambleImage.tsx`: seed FNV-1a từ key → PRNG mulberry32 → Fisher-Yates tạo permutation → nghịch đảo để vẽ lại. Lazy-load ảnh qua IntersectionObserver (`rootMargin 500px`).
+Ảnh chapter trên Drive được xáo trộn grid NxN. Frontend **unscramble ở client** bằng canvas.
+- Master key chỉ ở backend (`Scramble:MasterKey` / env `SCRAMBLE_MASTER_KEY`). Backend trả key per-chapter = HMAC-SHA256(masterKey, slug) + grid qua endpoint auth/rate-limited; không trả master key.
+- `Chapter.Slug` + `Chapter.Grid` lấy từ `manifest.json`; frontend không còn `VITE_SCRAMBLE_KEY` / `VITE_SCRAMBLE_GRID`.
+- Google Picker append flow cần `VITE_GOOGLE_API_KEY` (Docker arg từ `GOOGLE_API_KEY`) để chọn manga Drive có sẵn và merge manifest khi thêm chapter.
+- Thuật toán ở `lib/scramble.ts` + `components/UnscrambleImage.tsx`: HMAC derived key → seed FNV-1a → PRNG mulberry32 → Fisher-Yates → nghịch đảo để vẽ lại. Lazy-load qua IntersectionObserver (`rootMargin 500px`).
 - Ảnh tải qua `fetch(src, { credentials: 'include' })` để gửi cookie `img_token`.
 
 ## API endpoints (tóm tắt)
