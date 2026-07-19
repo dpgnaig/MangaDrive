@@ -1,0 +1,6 @@
+@MangaDrive.Api_HostAddress = http://localhost:5007
+
+GET {{MangaDrive.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

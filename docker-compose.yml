@@ -1,0 +1,41 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - ConnectionStrings__DefaultConnection=Data Source=/app/data/mangadrive.db
+      - Jwt__Secret=${JWT_SECRET:-YourSuperSecretKeyAtLeast32CharsLong!!}
+      - Jwt__Issuer=MangaDrive
+      - Jwt__Audience=MangaDrive
+      - Jwt__AccessTokenMinutes=60
+      - Jwt__RefreshTokenDays=30
+      - Google__ClientId=${GOOGLE_CLIENT_ID}
+      - Google__ClientSecret=${GOOGLE_CLIENT_SECRET}
+      - Google__ServiceAccountKeyPath=/app/secrets/service-account-key.json
+      - Cors__AllowedOrigins__0=http://localhost:3000
+      - AdminEmails__0=${ADMIN_EMAIL:-admin@example.com}
+      - Scramble__Enabled=${SCRAMBLE_ENABLED:-true}
+    volumes:
+      - db-data:/app/data
+      - ./secrets:/app/secrets:ro
+    expose:
+      - "5000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+        VITE_SCRAMBLE_KEY: ${SCRAMBLE_KEY}
+        VITE_SCRAMBLE_GRID: ${SCRAMBLE_GRID:-6}
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  db-data:

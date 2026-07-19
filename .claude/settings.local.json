@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet build *)",
+      "Bash(npx tsc *)",
+      "Bash(grep -E '^\\(tsc|vite\\)$')",
+      "Bash(docker volume *)",
+      "Bash(docker compose *)",
+      "Bash(docker run *)",
+      "Bash(docker exec *)",
+      "Bash(bash -n /home/ubuntu/mangadrive/deploy.sh)",
+      "Read(//home/ubuntu/**)",
+      "Read(//home/ubuntu/.claude/**)",
+      "Bash(npm view *)",
+      "Bash(claude update *)"
+    ]
+  },
+  "skillOverrides": {
+    "mangadrive": "user-invocable-only"
+  }
+}

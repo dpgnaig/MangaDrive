@@ -1,0 +1,117 @@
+<Window x:Class="MangaMetadataScraper.App.Views.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Settings"
+        Width="520" Height="480"
+        ResizeMode="CanResizeWithGrip"
+        WindowStartupLocation="CenterOwner"
+        Background="#1E1E2E">
+
+    <Window.Resources>
+        <Style TargetType="Label">
+            <Setter Property="Foreground" Value="#A6ADC8"/>
+            <Setter Property="FontSize"   Value="11"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding"    Value="0,0,0,2"/>
+        </Style>
+        <Style x:Key="InputStyle" TargetType="TextBox">
+            <Setter Property="Background"     Value="#313244"/>
+            <Setter Property="Foreground"     Value="#CDD6F4"/>
+            <Setter Property="BorderBrush"    Value="#45475A"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding"        Value="8,5"/>
+            <Setter Property="FontSize"       Value="13"/>
+        </Style>
+        <Style x:Key="CheckStyle" TargetType="CheckBox">
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+            <Setter Property="FontSize"   Value="13"/>
+        </Style>
+        <Style x:Key="SectionHeader" TargetType="TextBlock">
+            <Setter Property="Foreground"  Value="#CBA6F7"/>
+            <Setter Property="FontSize"    Value="13"/>
+            <Setter Property="FontWeight"  Value="Bold"/>
+            <Setter Property="Margin"      Value="0,0,0,8"/>
+        </Style>
+        <Style x:Key="PrimaryBtn" TargetType="Button">
+            <Setter Property="Background"     Value="#CBA6F7"/>
+            <Setter Property="Foreground"     Value="#1E1E2E"/>
+            <Setter Property="FontWeight"     Value="Bold"/>
+            <Setter Property="Padding"        Value="20,7"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor"         Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="6"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#D4BFFF"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="SecondaryBtn" TargetType="Button" BasedOn="{StaticResource PrimaryBtn}">
+            <Setter Property="Background" Value="#45475A"/>
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0">
+
+            <!-- ── CuuTruyen ─────────────────────────────────────────── -->
+            <Border Background="#313244" CornerRadius="8" Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="1. CuuTruyen" Style="{StaticResource SectionHeader}"/>
+
+                    <Label Content="SOURCE URL"/>
+                    <TextBox Style="{StaticResource InputStyle}"
+                             Text="{Binding CuuTruyenUrl, UpdateSourceTrigger=PropertyChanged}"
+                             Margin="0,0,0,10"/>
+
+                    <CheckBox Style="{StaticResource CheckStyle}"
+                              Content="Headless mode (ẩn browser)"
+                              IsChecked="{Binding CuuTruyenHeadless}"/>
+                </StackPanel>
+            </Border>
+
+            <!-- ── TruyenQQ ──────────────────────────────────────────── -->
+            <Border Background="#313244" CornerRadius="8" Padding="16">
+                <StackPanel>
+                    <TextBlock Text="2. TruyenQQ" Style="{StaticResource SectionHeader}"/>
+
+                    <Label Content="SOURCE URL"/>
+                    <TextBox Style="{StaticResource InputStyle}"
+                             Text="{Binding TruyenQQUrl, UpdateSourceTrigger=PropertyChanged}"
+                             Margin="0,0,0,10"/>
+
+                    <CheckBox Style="{StaticResource CheckStyle}"
+                              Content="Headless mode (ẩn browser)"
+                              IsChecked="{Binding TruyenQQHeadless}"/>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+
+        <!-- ── Buttons ───────────────────────────────────────────────── -->
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Margin="0,16,0,0">
+            <Button Style="{StaticResource SecondaryBtn}"
+                    Content="Cancel"
+                    Command="{Binding CancelCommand}"
+                    Margin="0,0,8,0"/>
+            <Button Style="{StaticResource PrimaryBtn}"
+                    Content="💾 Save"
+                    Command="{Binding SaveCommand}"/>
+        </StackPanel>
+    </Grid>
+</Window>

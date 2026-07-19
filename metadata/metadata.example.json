@@ -1,0 +1,18 @@
+{
+  "title": "Farming Life in Another World",
+  "otherTitles": [
+    { "lang": "ja", "title": "異世界のんびり農家" },
+    { "lang": "vi", "title": "Cuộc Sống Nông Dân Ở Thế Giới Khác" },
+    { "lang": "ko", "title": "이세계 느긋한 농가" },
+    { "lang": "zh", "title": "异世界悠闲农家" }
+  ],
+  "description": "Mô tả truyện...",
+  "author": "Naitou Kinosuke",
+  "artist": "Tsurugi Yasuyuki",
+  "status": "ongoing",
+  "genres": ["Action", "Adventure", "Fantasy"],
+  "themes": ["Harem", "Magic", "Isekai"],
+  "demographic": "Shounen",
+  "cover": "cover.jpg",
+  "banner": "banner.jpg"
+}

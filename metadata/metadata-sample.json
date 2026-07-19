@@ -1,0 +1,15 @@
+{
+  "title": "One Piece",
+  "otherTitles": ["Vua Hải Tặc"],
+  "description": "Monkey D. Luffy, a boy whose body gained the properties of rubber after unintentionally eating a Devil Fruit, sets off on an adventure to find the legendary One Piece treasure and become the King of the Pirates.",
+  "author": "Oda Eiichiro",
+  "status": "ongoing",
+  "genres": [
+    "Action",
+    "Adventure",
+    "Comedy",
+    "Fantasy"
+  ],
+  "cover": "cover.jpg",
+  "banner": "banner.jpg"
+}

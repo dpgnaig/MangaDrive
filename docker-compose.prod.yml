@@ -1,0 +1,61 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    depends_on:
+      - frontend
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Data Source=/app/data/mangadrive.db
+      - Jwt__Secret=${JWT_SECRET}
+      - Jwt__Issuer=MangaDrive
+      - Jwt__Audience=MangaDrive
+      - Jwt__AccessTokenMinutes=60
+      - Jwt__RefreshTokenDays=30
+      - Cookies__Secure=true
+      - Google__ClientId=${GOOGLE_CLIENT_ID}
+      - Google__ClientSecret=${GOOGLE_CLIENT_SECRET}
+      - Google__ServiceAccountKeyPath=/app/secrets/service-account-key.json
+      - Cors__AllowedOrigins__0=https://${DOMAIN}
+      - AdminEmails__0=${ADMIN_EMAIL}
+      - Scramble__Enabled=${SCRAMBLE_ENABLED:-true}
+    volumes:
+      - db-data:/app/data
+      - ./secrets:/app/secrets:ro
+    expose:
+      - "5000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+        VITE_SCRAMBLE_KEY: ${SCRAMBLE_KEY}
+        VITE_SCRAMBLE_GRID: ${SCRAMBLE_GRID:-6}
+    expose:
+      - "80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:

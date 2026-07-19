@@ -1,0 +1,7 @@
+{$DOMAIN:localhost} {
+    reverse_proxy frontend:80
+}
+
+www.{$DOMAIN:localhost} {
+    redir https://{$DOMAIN:localhost}{uri} permanent
+}
