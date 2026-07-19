@@ -85,6 +85,20 @@ async function processToBlob(bitmap: ImageBitmap, perm: number[], grid: number):
   })
 }
 
+// Read files sitting directly at the manga-folder root (metadata.json, cover,
+// banner...). These are copied verbatim into the scrambled output so it becomes a
+// self-contained manga folder that sync ingests unchanged — title/cover intact.
+// Chapter images live in subfolders, not here, so this never picks up page images.
+async function readRootFiles(dir: FileSystemDirectoryHandle): Promise<{ name: string; handle: FileSystemFileHandle }[]> {
+  const files: { name: string; handle: FileSystemFileHandle }[] = []
+  for await (const [name, handle] of dir.entries()) {
+    if (handle.kind === 'file') {
+      files.push({ name, handle: handle as FileSystemFileHandle })
+    }
+  }
+  return files
+}
+
 // Collect image files directly inside a directory handle, sorted by name.
 async function readImageFiles(dir: FileSystemDirectoryHandle): Promise<{ name: string; handle: FileSystemFileHandle }[]> {
   const files: { name: string; handle: FileSystemFileHandle }[] = []
@@ -114,6 +128,19 @@ async function readManifest(dir: FileSystemDirectoryHandle): Promise<ChapterMani
   const handle = await dir.getFileHandle('manifest.json')
   const text = await (await handle.getFile()).text()
   return JSON.parse(text)
+}
+
+// Copy the non-image files sitting directly at the input root (metadata.json,
+// cover/banner images referenced by it) verbatim into the Drive manga folder, so
+// sync's ApplyMetadata keeps the manga's title/cover. Chapter pages live in slug
+// subfolders; anything loose at the root is metadata to carry over. We upload the
+// original bytes (no scramble) — cover/banner are served as-is by /api/images.
+async function copyRootFilesToDrive(inputDir: FileSystemDirectoryHandle, driveMangaId: string): Promise<void> {
+  for await (const [name, handle] of inputDir.entries()) {
+    if (handle.kind !== 'file' || name === 'manifest.json') continue
+    const blob = await (handle as FileSystemFileHandle).getFile()
+    await uploadDriveFile(name, blob, driveMangaId)
+  }
 }
 
 export default function AdminScrambleTab() {
@@ -308,13 +335,19 @@ export default function AdminScrambleTab() {
     setTotal(grandTotal)
     if (grandTotal === 0) { message.warning('Không tìm thấy ảnh trong folder'); return }
 
-    // For Drive destination, create one run root folder that holds every chapter
-    // subfolder + the manifest. Sharing this root with the service account cascades
-    // read access to all children, so /api/images can proxy the tiles.
+    // Drive output must mirror the sync folder concept so sync ingests it with NO
+    // code change: <shared run root>/<manga name>/<slug chapter>/NNN.png, with
+    // manifest.json + copied metadata/cover at the manga-folder root. Sync lists
+    // root → mangas → chapters, so the shared/auto-added root folder is the run root
+    // and the manga folder sits one level down. The manga folder takes the original
+    // input folder name so the manga keeps its title/cover after sync.
+    const hasChapterSubfolders = subDirs.length > 0
     let driveRootId: string | null = null
+    let driveMangaId: string | null = null
     if (dest === 'drive') {
       const runName = `scramble-${new Date().toISOString().replace(/[:.]/g, '-')}`
       driveRootId = await createDriveFolder(runName)
+      driveMangaId = await createDriveFolder(inputDir!.name, driveRootId)
     }
 
     const manifest: ChapterManifestEntry[] = []
@@ -332,7 +365,7 @@ export default function AdminScrambleTab() {
         ? await outputDir!.getDirectoryHandle(slug, { create: true })
         : null
       const driveChapterId = dest === 'drive'
-        ? await createDriveFolder(slug, driveRootId!)
+        ? await createDriveFolder(slug, driveMangaId!)
         : null
 
       // Pair each file with its 1-based sequence up front, so output names stay
@@ -386,8 +419,15 @@ export default function AdminScrambleTab() {
       await manifestWritable.write(manifestJson)
       await manifestWritable.close()
     } else {
-      await uploadDriveFile('manifest.json', new Blob([manifestJson], { type: 'application/json' }), driveRootId!)
+      // manifest.json + metadata/cover go at the MANGA-folder root (not the run
+      // root): sync reads them from the manga folder (ListFilesAsync(manga.DriveFileId)).
+      await uploadDriveFile('manifest.json', new Blob([manifestJson], { type: 'application/json' }), driveMangaId!)
+      // Copy the non-image root files (metadata.json, cover/banner) verbatim so the
+      // synced manga keeps its title/cover. Chapter images live in slug subfolders,
+      // so anything at the input root is metadata to carry over.
+      await copyRootFilesToDrive(inputDir!, driveMangaId!)
       // Grant the read-only service account access so /api/images can serve tiles.
+      // Sharing the run root cascades to the manga folder and every chapter subfolder.
       if (serviceEmail) await shareWithServiceAccount(driveRootId!, serviceEmail)
     }
 
