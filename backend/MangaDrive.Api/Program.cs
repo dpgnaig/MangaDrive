@@ -63,6 +63,29 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     });
 
 builder.Services.AddAuthorization();
+
+// Per-user rate limit for the scramble-key endpoint: throttles bulk enumeration of
+// per-chapter keys while leaving normal sequential reading unaffected. Partitioned
+// on the authenticated user id (falls back to remote IP for unauthenticated calls).
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("scramble-key", httpContext =>
+    {
+        var partitionKey = httpContext.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+            ?? httpContext.Connection.RemoteIpAddress?.ToString()
+            ?? "anonymous";
+        return System.Threading.RateLimiting.RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey,
+            _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 20,
+                Window = TimeSpan.FromSeconds(10),
+                QueueLimit = 0
+            });
+    });
+});
+
 builder.Services.AddControllers()
     .AddJsonOptions(o =>
     {
@@ -431,6 +454,7 @@ using (var scope = app.Services.CreateScope())
 app.UseCors();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 app.MapControllers();
 app.MapHub<SyncHub>("/hubs/sync");
 app.MapHub<CommentHub>("/hubs/comments");

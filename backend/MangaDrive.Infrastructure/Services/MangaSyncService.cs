@@ -175,9 +175,17 @@ public class MangaSyncService : IMangaSyncService
             }
         }
 
-        // Sync chapters
+        // Per-chapter scramble manifest: folders on Drive are named by slug
+        // (chapter-<hex>), so the real chapter name, number, grid and ordering all
+        // live in manifest.json at the manga-folder root. Map slug -> entry.
+        var scrambleManifest = await ReadScrambleManifest(files, manga.Id, ct);
+
+        // Sync chapters. Order by the ORIGINAL chapter number from the manifest
+        // (sorting the slug folder names directly would be meaningless).
         var chapterFolders = (await _drive.ListFoldersAsync(manga.DriveFileId))
-            .OrderBy(f => ExtractNumber(f.Name)).ToList();
+            .OrderBy(f => ExtractNumber(
+                scrambleManifest.TryGetValue(f.Name, out var e) ? e.Original : f.Name))
+            .ToList();
         _syncedChaptersBeforeCurrentManga = job.SyncedChapter;
         _currentMangaChapterCount = chapterFolders.Count;
         _currentMangaNewChapters = 0;
@@ -193,19 +201,25 @@ public class MangaSyncService : IMangaSyncService
             job.CurrentChapter = cf.Name;
             await SaveAndNotify(job, rootName);
 
+            // For scrambled uploads the Drive folder is named by slug; the human
+            // chapter name/number lives in the manifest entry. Fall back to the
+            // folder name for legacy (unscrambled) folders with no manifest.
+            scrambleManifest.TryGetValue(cf.Name, out var manifestEntry);
+            var displayName = manifestEntry?.Original ?? cf.Name;
+
             var chapter = await _db.Chapters.FirstOrDefaultAsync(
                 c => c.MangaId == manga.Id && c.DriveFileId == cf.Id, ct);
             if (chapter == null)
             {
-                var extractedNumber = ExtractChapterNumber(cf.Name);
-                var extractedName = ExtractChapterName(cf.Name);
                 chapter = new Chapter
                 {
                     MangaId = manga.Id,
                     DriveFileId = cf.Id,
-                    Name = cf.Name,
-                    ChapterNumber = extractedNumber,
-                    ChapterName = extractedName,
+                    Name = displayName,
+                    ChapterNumber = ExtractChapterNumber(displayName),
+                    ChapterName = ExtractChapterName(displayName),
+                    Slug = manifestEntry?.Slug,
+                    Grid = manifestEntry?.Grid,
                     SortOrder = i
                 };
                 _db.Chapters.Add(chapter);
@@ -220,6 +234,13 @@ public class MangaSyncService : IMangaSyncService
                 {
                     chapter.ChapterNumber = ExtractChapterNumber(chapter.Name);
                     chapter.ChapterName = ExtractChapterName(chapter.Name);
+                }
+                // Backfill scramble slug/grid on re-sync for chapters synced before
+                // Phase 2, or re-uploaded with the manifest present.
+                if (manifestEntry != null)
+                {
+                    if (chapter.Slug == null) chapter.Slug = manifestEntry.Slug;
+                    if (chapter.Grid == null) chapter.Grid = manifestEntry.Grid;
                 }
             }
 
@@ -388,6 +409,39 @@ public class MangaSyncService : IMangaSyncService
         }
 
         manga.UpdatedAt = manga.UpdatedAt == default ? DateTime.UtcNow : manga.UpdatedAt;
+    }
+
+    private record ScrambleManifestEntry(string Original, string Slug, int Grid, int FileCount);
+
+    /// <summary>
+    /// Read the scramble manifest.json at the manga folder root (written by the
+    /// scramble tools). Returns a map keyed by slug — the Drive folder for each
+    /// scrambled chapter is named by its slug, so sync looks entries up by folder
+    /// name. Returns an empty map for legacy (unscrambled) mangas with no manifest.
+    /// </summary>
+    private async Task<Dictionary<string, ScrambleManifestEntry>> ReadScrambleManifest(
+        List<DriveFile> files, Guid mangaId, CancellationToken ct)
+    {
+        var manifestFile = files.FirstOrDefault(f => f.Name == "manifest.json");
+        if (manifestFile == null) return new();
+
+        try
+        {
+            var json = await _drive.GetFileContentAsync(manifestFile.Id);
+            if (string.IsNullOrEmpty(json)) return new();
+
+            var entries = JsonSerializer.Deserialize<List<ScrambleManifestEntry>>(json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new();
+            return entries
+                .Where(e => !string.IsNullOrEmpty(e.Slug))
+                .GroupBy(e => e.Slug)
+                .ToDictionary(g => g.Key, g => g.First());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read scramble manifest for manga {Id}", mangaId);
+            return new();
+        }
     }
 
     private int _currentMangaChapterCount;

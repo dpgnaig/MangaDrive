@@ -229,7 +229,7 @@ public static class ImageProcessor
             {
                 ct.ThrowIfCancellationRequested();
                 var slug = NewSlug();
-                var key = $"{baseKey}:{slug}";
+                var key = ScrambleAlgorithm.DeriveChapterKey(baseKey, slug);
                 var outChapterDir = Path.Combine(outputFolder, slug);
                 Directory.CreateDirectory(outChapterDir);
 
@@ -298,7 +298,7 @@ public static class ImageProcessor
             foreach (var (entry, files) in chapters)
             {
                 ct.ThrowIfCancellationRequested();
-                var key = $"{baseKey}:{entry.Slug}";
+                var key = ScrambleAlgorithm.DeriveChapterKey(baseKey, entry.Slug);
                 var outChapterDir = Path.Combine(outputFolder, entry.Original);
                 Directory.CreateDirectory(outChapterDir);
 

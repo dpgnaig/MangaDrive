@@ -15,6 +15,15 @@ interface ChapterDetail {
 }
 interface ChapterNav { id: string; name: string; sortOrder: number }
 
+// Per-chapter scramble config fetched from /chapters/{id}/scramble-key.
+// 'loading' = request in flight; 'unavailable' = chapter scrambled but not
+// ready to decode (missing slug / server key), so we show a clear error.
+type ScrambleState =
+  | { status: 'none' }
+  | { status: 'loading' }
+  | { status: 'ready'; key: string; grid: number }
+  | { status: 'unavailable'; message: string }
+
 function LazyImage({ src, alt, onTap }: { src: string; alt: string; onTap: () => void }) {
   const [loaded, setLoaded] = useState(false)
   return (
@@ -36,13 +45,27 @@ export default function ChapterReader() {
   const [reportOpen, setReportOpen] = useState(false)
   const [reportReason, setReportReason] = useState('')
   const [reporting, setReporting] = useState(false)
+  const [scramble, setScramble] = useState<ScrambleState>({ status: 'none' })
 
   useEffect(() => {
+    setScramble({ status: 'none' })
     api.get(`/chapters/${id}`).then(r => {
       setChapter(r.data)
       api.get(`/mangas/${r.data.mangaId}/chapters`).then(res =>
         setChapters(res.data.sort((a: ChapterNav, b: ChapterNav) => a.sortOrder - b.sortOrder)))
       api.post('/reading-progress', { mangaId: r.data.mangaId, chapterId: r.data.id, pageIndex: 0 }).catch(() => {})
+
+      // Scrambled chapters need a per-chapter key from the server (never the master
+      // key). Fetch it before rendering pages so UnscrambleImage gets {key, grid}.
+      if (r.data.isScrambled) {
+        setScramble({ status: 'loading' })
+        api.get(`/chapters/${r.data.id}/scramble-key`)
+          .then(res => setScramble({ status: 'ready', key: res.data.key, grid: res.data.grid }))
+          .catch(err => setScramble({
+            status: 'unavailable',
+            message: err?.response?.data?.message || 'Không tải được khóa giải mã chương này.',
+          }))
+      }
     })
   }, [id])
 
@@ -100,17 +123,29 @@ export default function ChapterReader() {
 
       {/* Images */}
       <div style={{ maxWidth: 820, margin: '0 auto' }} onClick={e => e.stopPropagation()}>
-        {chapter.images.map(img => (
-          chapter.isScrambled && import.meta.env.VITE_SCRAMBLE_KEY
-            ? <UnscrambleImage
-                key={img.id}
-                src={imgUrl(img.driveFileId)}
-                alt={img.fileName}
-                scrambleConfig={{ key: import.meta.env.VITE_SCRAMBLE_KEY, grid: Number(import.meta.env.VITE_SCRAMBLE_GRID) || 4 }}
-              />
-            : <LazyImage key={img.id} src={imgUrl(img.driveFileId)} alt={img.fileName}
-                onTap={() => openViewer(imgUrl(img.driveFileId), img.fileName)} />
-        ))}
+        {chapter.isScrambled && scramble.status === 'unavailable' ? (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 12, padding: '80px 24px', textAlign: 'center' }}>
+            <span className="ms" style={{ fontSize: 40, color: 'var(--text-muted)' }}>lock</span>
+            <p style={{ color: '#fff', fontSize: 15, fontWeight: 600 }}>Chương chưa sẵn sàng</p>
+            <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 13, maxWidth: 340 }}>{scramble.message}</p>
+          </div>
+        ) : chapter.isScrambled && scramble.status !== 'ready' ? (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '80px 0' }}>
+            <span className="ms spin" style={{ fontSize: 28, color: 'var(--text-muted)' }}>progress_activity</span>
+          </div>
+        ) : (
+          chapter.images.map(img => (
+            chapter.isScrambled && scramble.status === 'ready'
+              ? <UnscrambleImage
+                  key={img.id}
+                  src={imgUrl(img.driveFileId)}
+                  alt={img.fileName}
+                  scrambleConfig={{ key: scramble.key, grid: scramble.grid }}
+                />
+              : <LazyImage key={img.id} src={imgUrl(img.driveFileId)} alt={img.fileName}
+                  onTap={() => openViewer(imgUrl(img.driveFileId), img.fileName)} />
+          ))
+        )}
       </div>
 
       {/* Bottom bar — reuses the shared BottomNavBar shell so Prev / List / Next

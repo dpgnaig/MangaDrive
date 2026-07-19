@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Input, Button, Progress, Select, Segmented, message } from 'antd'
-import { generatePermutation, generateInversePermutation } from '../../lib/scramble'
+import { generatePermutation, generateInversePermutation, deriveChapterKey } from '../../lib/scramble'
 import api from '../../lib/api'
 import { connectDrive, disconnectDrive, createDriveFolder, uploadDriveFile, shareWithServiceAccount } from '../../lib/googleDrive'
 
@@ -263,7 +263,7 @@ export default function AdminScrambleTab() {
         const files = await readImageFiles(chapterDir)
         if (files.length === 0) { message.warning('Chapter đầu tiên không có ảnh'); return }
         fileHandle = files[0].handle
-        perm = generateInversePermutation(`${masterKey.trim()}:${entry.slug}`, g)
+        perm = generateInversePermutation(await deriveChapterKey(masterKey.trim(), entry.slug), g)
       }
 
       const blob = await fileHandle.getFile()
@@ -324,7 +324,7 @@ export default function AdminScrambleTab() {
     for (const ch of chapterFiles) {
       if (cancelledRef.current) break
       const slug = newSlug()
-      const key = `${masterKey.trim()}:${slug}`
+      const key = await deriveChapterKey(masterKey.trim(), slug)
       setCurrentLabel(`${ch.name} → ${slug}`)
 
       // Output target for this chapter: a local dir handle, or a Drive folder id.
@@ -399,7 +399,7 @@ export default function AdminScrambleTab() {
   }
 
   const runUnscramble = async () => {
-    // Reads <input>/manifest.json; for each entry, key = masterKey:slug + entry.grid
+    // Reads <input>/manifest.json; for each entry, key = HMAC(masterKey, slug) + entry.grid
     // restores <input>/<slug>/* back to <output>/<original>/NNN.png.
     const manifest = await readManifest(inputDir!).catch(() => null)
     if (!manifest || manifest.length === 0) {
@@ -423,7 +423,7 @@ export default function AdminScrambleTab() {
     let processed = 0
     for (const { entry, files } of chapters) {
       if (cancelledRef.current) break
-      const key = `${masterKey.trim()}:${entry.slug}`
+      const key = await deriveChapterKey(masterKey.trim(), entry.slug)
       const outChapterDir = await outputDir!.getDirectoryHandle(entry.original, { create: true })
 
       let seq = 1

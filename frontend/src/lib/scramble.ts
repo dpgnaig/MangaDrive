@@ -36,6 +36,20 @@ export function generatePermutation(key: string, grid: number): number[] {
   return indices
 }
 
+// Derive the per-chapter key = HMAC-SHA256(masterKey, slug) as a lowercase hex
+// string. This hex string is then fed into getSeedFromKey → mulberry32 →
+// Fisher-Yates unchanged. Must stay byte-identical to the C# DeriveChapterKey
+// (scramble/MangaScramble/ScrambleAlgorithm.cs) and the backend derivation, or
+// the reader and the scramble tool will disagree on the permutation.
+export async function deriveChapterKey(masterKey: string, slug: string): Promise<string> {
+  const enc = new TextEncoder()
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw', enc.encode(masterKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  )
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(slug))
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
 export function generateInversePermutation(key: string, grid: number): number[] {
   const perm = generatePermutation(key, grid)
   const inverse = new Array(perm.length)

@@ -228,6 +228,48 @@ public class ChaptersController : ControllerBase
         return Ok(new ChapterDetailDto(chapter.Id, mangaId, chapter.Name, chapter.SortOrder, images, isScrambled));
     }
 
+    /// <summary>
+    /// Session-gated per-chapter scramble key. Returns the derived key
+    /// HMAC-SHA256(masterKey, slug) — never the master key itself — plus the grid,
+    /// for the specific chapter the authorized user is reading. Rate-limited to
+    /// throttle bulk key enumeration.
+    /// </summary>
+    [HttpGet("{id:guid}/scramble-key")]
+    [Microsoft.AspNetCore.RateLimiting.EnableRateLimiting("scramble-key")]
+    public async Task<IActionResult> ScrambleKey(Guid id)
+    {
+        if (!_config.GetValue<bool>("Scramble:Enabled")) return NotFound();
+
+        var chapter = await _db.Chapters.FirstOrDefaultAsync(c => c.Id == id);
+        if (chapter == null) return NotFound();
+
+        // Scrambled chapter with no slug = synced before Phase 2 / manifest missing.
+        // Tell the reader clearly so it can show "chưa sẵn sàng, cần re-sync".
+        if (string.IsNullOrEmpty(chapter.Slug) || chapter.Grid == null)
+            return Conflict(new { code = "SLUG_MISSING", message = "Chương chưa sẵn sàng để giải mã (cần re-sync)." });
+
+        var masterKey = _config["Scramble:MasterKey"];
+        if (string.IsNullOrEmpty(masterKey))
+        {
+            // Misconfiguration: enabled but no server key. Don't leak details.
+            return StatusCode(500, new { code = "SERVER_KEY_MISSING", message = "Máy chủ chưa cấu hình khóa giải mã." });
+        }
+
+        var key = DeriveChapterKey(masterKey, chapter.Slug);
+        return Ok(new { key, grid = chapter.Grid });
+    }
+
+    // HMAC-SHA256(masterKey, slug) as lowercase hex. Must stay byte-identical to the
+    // JS deriveChapterKey (frontend/src/lib/scramble.ts) and the C# tool's
+    // ScrambleAlgorithm.DeriveChapterKey, or the reader can't reverse the permutation.
+    private static string DeriveChapterKey(string masterKey, string slug)
+    {
+        using var hmac = new System.Security.Cryptography.HMACSHA256(
+            System.Text.Encoding.UTF8.GetBytes(masterKey));
+        var sig = hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(slug));
+        return Convert.ToHexString(sig).ToLowerInvariant();
+    }
+
     /// <summary>Reader reports a problem with a chapter; notifies every admin.</summary>
     [HttpPost("{id:guid}/report")]
     public async Task<IActionResult> Report(Guid id, [FromBody] ReportChapterDto dto)
