@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Input, Button, Progress, Select, Segmented, message } from 'antd'
 import { generatePermutation, generateInversePermutation, deriveChapterKey } from '../../lib/scramble'
 import api from '../../lib/api'
-import { connectDrive, disconnectDrive, createDriveFolder, uploadDriveFile, shareWithServiceAccount } from '../../lib/googleDrive'
+import { connectDrive, disconnectDrive, createDriveFolder, uploadDriveFile, shareWithServiceAccount, pickDriveFolder, findChildByName, downloadDriveFileText, updateDriveFileContent } from '../../lib/googleDrive'
 
 type Dest = 'local' | 'drive'
 
@@ -152,6 +152,11 @@ export default function AdminScrambleTab() {
   // Where scrambled output goes: a local folder (original flow) or straight up to
   // the admin's personal Drive. Unscramble is always local.
   const [dest, setDest] = useState<Dest>('local')
+  // Drive scramble target: a brand-new manga (create run root + manga folder) or
+  // append new chapters into an EXISTING manga folder picked via Google Picker.
+  const [driveMode, setDriveMode] = useState<'new' | 'append'>('new')
+  const [driveTarget, setDriveTarget] = useState<{ id: string; name: string } | null>(null)
+  const [picking, setPicking] = useState(false)
   const [driveEmail, setDriveEmail] = useState<string | null>(null)
   const [driveConnecting, setDriveConnecting] = useState(false)
   const [serviceEmail, setServiceEmail] = useState('')
@@ -214,6 +219,24 @@ export default function AdminScrambleTab() {
   const disconnectDriveAccount = () => {
     disconnectDrive()
     setDriveEmail(null)
+    setDriveTarget(null)
+  }
+
+  // Pick an existing manga folder (from a prior scramble run) to append new
+  // chapters into. Requires a connected Drive first — the Picker reuses that token.
+  const pickTargetFolder = async () => {
+    if (!driveEmail) { message.warning('Vui lòng kết nối Google Drive trước'); return }
+    setPicking(true)
+    try {
+      const picked = await pickDriveFolder()
+      if (picked) {
+        setDriveTarget(picked)
+        message.success(`Đã chọn manga đích: ${picked.name}`)
+      }
+    } catch (e: any) {
+      message.error(e?.message || 'Chọn folder thất bại')
+    }
+    setPicking(false)
   }
 
   const savePassword = async () => {
@@ -341,13 +364,29 @@ export default function AdminScrambleTab() {
     // root → mangas → chapters, so the shared/auto-added root folder is the run root
     // and the manga folder sits one level down. The manga folder takes the original
     // input folder name so the manga keeps its title/cover after sync.
-    const hasChapterSubfolders = subDirs.length > 0
+    // Drive output must mirror the sync folder concept so sync ingests it with NO
+    // code change.
+    //  - 'new':    <run root>/<manga name>/<slug chapter>/NNN.png  (fresh manga)
+    //  - 'append': <picked manga folder>/<slug chapter>/NNN.png    (existing manga)
+    // In append mode the picked folder IS the manga folder (its DriveFileId is
+    // already in the DB from the first sync), so new slug subfolders land beside the
+    // old ones and sync picks them up as new chapters. shareThisId is what we grant
+    // the service account: the run root ('new') cascades to children; in 'append'
+    // the manga folder is already shared, but we re-share it (idempotent) to be safe.
+    const appendMode = dest === 'drive' && driveMode === 'append'
     let driveRootId: string | null = null
     let driveMangaId: string | null = null
+    let shareThisId: string | null = null
     if (dest === 'drive') {
-      const runName = `scramble-${new Date().toISOString().replace(/[:.]/g, '-')}`
-      driveRootId = await createDriveFolder(runName)
-      driveMangaId = await createDriveFolder(inputDir!.name, driveRootId)
+      if (appendMode) {
+        driveMangaId = driveTarget!.id
+        shareThisId = driveTarget!.id
+      } else {
+        const runName = `scramble-${new Date().toISOString().replace(/[:.]/g, '-')}`
+        driveRootId = await createDriveFolder(runName)
+        driveMangaId = await createDriveFolder(inputDir!.name, driveRootId)
+        shareThisId = driveRootId
+      }
     }
 
     const manifest: ChapterManifestEntry[] = []
@@ -412,23 +451,41 @@ export default function AdminScrambleTab() {
 
     if (cancelledRef.current) { message.info('Đã hủy'); return }
 
-    const manifestJson = JSON.stringify(manifest, null, 2)
     if (dest === 'local') {
       const manifestHandle = await outputDir!.getFileHandle('manifest.json', { create: true })
       const manifestWritable = await manifestHandle.createWritable()
-      await manifestWritable.write(manifestJson)
+      await manifestWritable.write(JSON.stringify(manifest, null, 2))
       await manifestWritable.close()
+    } else if (appendMode) {
+      // Append: the manga folder already holds a manifest.json covering the
+      // existing chapters. Sync sets each Chapter's Slug/Grid FROM the manifest, so
+      // the manifest MUST list every chapter (old + new) — otherwise the old ones
+      // lose their entry and the reader 409s (SLUG_MISSING). Download the existing
+      // manifest, append the new entries, and overwrite it IN PLACE (same file id,
+      // so sync doesn't treat it as a churned file). Metadata/cover are already in
+      // the folder from the first run, so we don't re-copy them.
+      const existingId = await findChildByName(driveMangaId!, 'manifest.json')
+      let merged = manifest
+      if (existingId) {
+        const prev = JSON.parse(await downloadDriveFileText(existingId)) as ChapterManifestEntry[]
+        merged = [...prev, ...manifest]
+        await updateDriveFileContent(existingId, new Blob([JSON.stringify(merged, null, 2)], { type: 'application/json' }))
+      } else {
+        await uploadDriveFile('manifest.json', new Blob([JSON.stringify(merged, null, 2)], { type: 'application/json' }), driveMangaId!)
+      }
+      // Re-share (idempotent) so the newly created chapter subfolders are covered.
+      if (serviceEmail) await shareWithServiceAccount(shareThisId!, serviceEmail)
     } else {
       // manifest.json + metadata/cover go at the MANGA-folder root (not the run
       // root): sync reads them from the manga folder (ListFilesAsync(manga.DriveFileId)).
-      await uploadDriveFile('manifest.json', new Blob([manifestJson], { type: 'application/json' }), driveMangaId!)
+      await uploadDriveFile('manifest.json', new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }), driveMangaId!)
       // Copy the non-image root files (metadata.json, cover/banner) verbatim so the
       // synced manga keeps its title/cover. Chapter images live in slug subfolders,
       // so anything at the input root is metadata to carry over.
       await copyRootFilesToDrive(inputDir!, driveMangaId!)
       // Grant the read-only service account access so /api/images can serve tiles.
       // Sharing the run root cascades to the manga folder and every chapter subfolder.
-      if (serviceEmail) await shareWithServiceAccount(driveRootId!, serviceEmail)
+      if (serviceEmail) await shareWithServiceAccount(shareThisId!, serviceEmail)
     }
 
     message.success(
@@ -501,6 +558,7 @@ export default function AdminScrambleTab() {
     if (!toDrive && !outputDir) { message.warning('Vui lòng chọn folder output'); return }
     if (toDrive && !driveEmail) { message.warning('Vui lòng kết nối Google Drive trước'); return }
     if (toDrive && !serviceEmail) { message.warning('Chưa lấy được service account email, thử lại sau'); return }
+    if (toDrive && driveMode === 'append' && !driveTarget) { message.warning('Vui lòng chọn manga đích để thêm chapter'); return }
     if (!(await verifyKey())) return
 
     cancelledRef.current = false
@@ -659,6 +717,36 @@ export default function AdminScrambleTab() {
                 <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '8px 0 0' }}>
                   Folder upload sẽ tự chia sẻ (chỉ đọc) tới service account <b>{serviceEmail}</b> để web đọc được ảnh.
                 </p>
+              )}
+            </div>
+          )}
+
+          {/* Drive target: create a new manga folder, or append new chapters into an
+              existing manga folder (picked via Google Picker). Append downloads the
+              existing manifest and merges the new chapter entries so old chapters keep
+              their slug/grid. */}
+          {mode === 'scramble' && dest === 'drive' && (
+            <div>
+              <label style={{ fontSize: 13, fontWeight: 500, display: 'block', marginBottom: 6 }}>Đích trên Drive</label>
+              <Segmented
+                value={driveMode}
+                onChange={v => { setDriveMode(v as 'new' | 'append'); setDriveTarget(null) }}
+                disabled={running}
+                options={[
+                  { label: 'Manga mới', value: 'new' },
+                  { label: 'Thêm chapter vào manga có sẵn', value: 'append' },
+                ]}
+                style={{ marginBottom: driveMode === 'append' ? 8 : 0 }}
+              />
+              {driveMode === 'append' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <Button onClick={pickTargetFolder} loading={picking} disabled={running || !driveEmail} style={{ borderRadius: 20, height: 34 }}>
+                    <span className="ms ms-sm">folder_special</span> {driveTarget ? `Manga: ${driveTarget.name}` : 'Chọn manga đích'}
+                  </Button>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    Chỉ chọn folder manga đã scramble trước đó (chứa manifest.json).
+                  </span>
+                </div>
               )}
             </div>
           )}

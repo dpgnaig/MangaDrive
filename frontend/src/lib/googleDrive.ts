@@ -10,9 +10,16 @@
 // account chooser so the admin can pick which Drive to upload into.
 
 const GIS_SRC = 'https://accounts.google.com/gsi/client'
+const GAPI_SRC = 'https://apis.google.com/js/api.js'
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string
+// Developer key for the Google Picker. Separate from the OAuth client id — create
+// an API key in the same Google Cloud project and restrict it to the Picker API.
+const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY as string
 // drive.file: create + manage only files this app creates. Narrowest scope that
 // still lets us upload folders/images and share them with the service account.
+// Selecting a folder through the Picker also grants the app drive.file access to
+// that folder and its contents, which is how "add chapters to an existing manga"
+// reaches a folder from a previous run.
 const SCOPE = 'https://www.googleapis.com/auth/drive.file'
 
 interface TokenClient {
@@ -34,6 +41,11 @@ declare global {
           revoke: (token: string, done?: () => void) => void
         }
       }
+      // Loaded on demand via gapi.load('picker'); only the bits we use are typed.
+      picker?: any
+    }
+    gapi?: {
+      load: (name: string, cb: () => void) => void
     }
   }
 }
@@ -53,6 +65,27 @@ function loadGis(): Promise<void> {
     document.head.appendChild(s)
   })
   return gisPromise
+}
+
+let gapiPromise: Promise<void> | null = null
+
+// Load gapi + the Picker module. The Picker lets the admin browse their own Drive
+// and pick an existing manga folder from a previous run (drive.file only grants
+// the app access to files it created, so without the Picker the app can't "find"
+// a prior folder to append chapters to — picking one re-grants that access).
+function loadPicker(): Promise<void> {
+  if (window.google?.picker) return Promise.resolve()
+  if (gapiPromise) return gapiPromise
+  gapiPromise = new Promise<void>((resolve, reject) => {
+    const s = document.createElement('script')
+    s.src = GAPI_SRC
+    s.async = true
+    s.defer = true
+    s.onload = () => window.gapi!.load('picker', () => resolve())
+    s.onerror = () => { gapiPromise = null; reject(new Error('Không tải được Google Picker')) }
+    document.head.appendChild(s)
+  })
+  return gapiPromise
 }
 
 // In-memory only — never persisted. A Drive access token is short-lived (~1h)
@@ -204,5 +237,84 @@ export async function shareWithServiceAccount(fileId: string, serviceEmail: stri
       },
     ),
     'Chia sẻ folder cho service account thất bại',
+  )
+}
+
+// Open the Google Picker so the admin can browse their own Drive and pick an
+// existing manga folder (from a prior scramble run) to append new chapters to.
+// Returns {id, name} of the picked folder, or null if cancelled. Picking a folder
+// re-grants the app drive.file access to it (drive.file otherwise only covers files
+// this app created), so subsequent uploads/manifest edits into it succeed.
+export async function pickDriveFolder(): Promise<{ id: string; name: string } | null> {
+  const token = await ensureToken()
+  await loadPicker()
+  const picker = window.google!.picker
+
+  return new Promise((resolve, reject) => {
+    if (!API_KEY) {
+      reject(new Error('Thiếu VITE_GOOGLE_API_KEY — cần API key để dùng Google Picker'))
+      return
+    }
+    const view = new picker.DocsView(picker.ViewId.FOLDERS)
+      .setSelectFolderEnabled(true)
+      .setMimeTypes('application/vnd.google-apps.folder')
+    const p = new picker.PickerBuilder()
+      .setOAuthToken(token)
+      .setDeveloperKey(API_KEY)
+      .addView(view)
+      .setCallback((data: any) => {
+        if (data.action === picker.Action.PICKED) {
+          const doc = data.docs?.[0]
+          resolve(doc ? { id: doc.id, name: doc.name } : null)
+        } else if (data.action === picker.Action.CANCEL) {
+          resolve(null)
+        }
+      })
+      .build()
+    p.setVisible(true)
+  })
+}
+
+// Find a direct child of parentId by exact name. Returns the file/folder id, or
+// null if absent. Used to locate the existing manifest.json (to append to) and to
+// detect chapter-slug collisions on re-runs.
+export async function findChildByName(parentId: string, name: string): Promise<string | null> {
+  const q = `'${parentId}' in parents and name = '${name.replace(/'/g, "\\'")}' and trashed = false`
+  const r = await driveFetch(
+    token => fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    ),
+    'Tìm file trên Drive thất bại',
+  )
+  const files = (await r.json()).files as { id: string; name: string }[]
+  return files?.[0]?.id ?? null
+}
+
+// Download a Drive file's raw text content (used to read the existing manifest.json).
+export async function downloadDriveFileText(fileId: string): Promise<string> {
+  const r = await driveFetch(
+    token => fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    ),
+    'Đọc file trên Drive thất bại',
+  )
+  return r.text()
+}
+
+// Overwrite an existing Drive file's content in place (keeps the same file id, so
+// sync sees the manifest update without treating it as a new file).
+export async function updateDriveFileContent(fileId: string, blob: Blob): Promise<void> {
+  await driveFetch(
+    token => fetch(
+      `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+      {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}` },
+        body: blob,
+      },
+    ),
+    'Cập nhật file trên Drive thất bại',
   )
 }
