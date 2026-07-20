@@ -277,9 +277,11 @@ export async function pickDriveFolder(): Promise<{ id: string; name: string } | 
 
 // Find a direct child of parentId by exact name. Returns the file/folder id, or
 // null if absent. Used to locate the existing manifest.json (to append to) and to
-// detect chapter-slug collisions on re-runs.
-export async function findChildByName(parentId: string, name: string): Promise<string | null> {
-  const q = `'${parentId}' in parents and name = '${name.replace(/'/g, "\\'")}' and trashed = false`
+// detect chapter-slug collisions on re-runs. Pass mimeType to disambiguate a
+// folder from a same-named file (e.g. verifying a chapter slug folder survived).
+export async function findChildByName(parentId: string, name: string, mimeType?: string): Promise<string | null> {
+  let q = `'${parentId}' in parents and name = '${name.replace(/'/g, "\\'")}' and trashed = false`
+  if (mimeType) q += ` and mimeType = '${mimeType}'`
   const r = await driveFetch(
     token => fetch(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)`,
@@ -289,6 +291,27 @@ export async function findChildByName(parentId: string, name: string): Promise<s
   )
   const files = (await r.json()).files as { id: string; name: string }[]
   return files?.[0]?.id ?? null
+}
+
+// Mime type Drive uses for folders — shared by findChildByName callers that need
+// to confirm a chapter slug child is actually a folder, not a same-named file.
+export const DRIVE_FOLDER_MIME = 'application/vnd.google-apps.folder'
+
+// Move a file/folder to trash (recoverable), rather than permanently deleting it.
+// Used to best-effort clean up a chapter folder left partial by a failed/cancelled
+// upload, so a re-run doesn't leave an orphan folder for sync to pick up.
+export async function trashDriveFile(fileId: string): Promise<void> {
+  await driveFetch(
+    token => fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}`,
+      {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trashed: true }),
+      },
+    ),
+    'Xóa folder dở trên Drive thất bại',
+  )
 }
 
 // Download a Drive file's raw text content (used to read the existing manifest.json).

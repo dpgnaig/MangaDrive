@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Input, Button, Progress, Select, Segmented, message } from 'antd'
 import { generatePermutation, generateInversePermutation, deriveChapterKey } from '../../lib/scramble'
 import api from '../../lib/api'
-import { connectDrive, disconnectDrive, createDriveFolder, uploadDriveFile, shareWithServiceAccount, pickDriveFolder, findChildByName, downloadDriveFileText, updateDriveFileContent } from '../../lib/googleDrive'
+import { connectDrive, disconnectDrive, createDriveFolder, uploadDriveFile, shareWithServiceAccount, pickDriveFolder, findChildByName, downloadDriveFileText, updateDriveFileContent, trashDriveFile, DRIVE_FOLDER_MIME } from '../../lib/googleDrive'
 
 type Dest = 'local' | 'drive'
 
@@ -23,17 +23,27 @@ const IMAGE_EXT = /\.(jpe?g|png|webp|bmp)$/i
 const DRIVE_CONCURRENCY = 4
 
 // Run `worker` over `items` with at most `limit` in flight at once. Resolves
-// when every item finishes. A worker that throws rejects the whole pool (the
-// caller's try/catch surfaces it), matching the old serial-loop behaviour.
+// when every item finishes. Once any worker throws, no runner picks up a new
+// item, but items already in flight are allowed to finish first — this keeps
+// other uploads from racing a chapter-folder trash triggered by the error.
+// The first error is re-thrown once every runner has settled.
 async function runPool<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
   let next = 0
+  let failed = false
+  let firstError: unknown = null
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
+    while (next < items.length && !failed) {
       const i = next++
-      await worker(items[i])
+      try {
+        await worker(items[i])
+      } catch (e) {
+        failed = true
+        if (firstError === null) firstError = e
+      }
     }
   })
   await Promise.all(runners)
+  if (failed) throw firstError
 }
 
 function formatDuration(ms: number): string {
@@ -128,6 +138,47 @@ async function readManifest(dir: FileSystemDirectoryHandle): Promise<ChapterMani
   const handle = await dir.getFileHandle('manifest.json')
   const text = await (await handle.getFile()).text()
   return JSON.parse(text)
+}
+
+function isValidManifestEntry(e: unknown): e is ChapterManifestEntry {
+  if (typeof e !== 'object' || e === null) return false
+  const r = e as Record<string, unknown>
+  return typeof r.original === 'string' && r.original.length > 0 &&
+    typeof r.slug === 'string' && r.slug.length > 0 &&
+    typeof r.grid === 'number' && Number.isFinite(r.grid) &&
+    typeof r.fileCount === 'number' && Number.isFinite(r.fileCount)
+}
+
+// Parse + validate a Drive manifest.json before trusting it as a checkpoint
+// source for append mode. Throws with a message meant for the admin rather
+// than silently treating malformed/foreign JSON as "no chapters done yet".
+function parseManifestStrict(text: string): ChapterManifestEntry[] {
+  let data: unknown
+  try {
+    data = JSON.parse(text)
+  } catch {
+    throw new Error('manifest.json trên Drive không phải JSON hợp lệ')
+  }
+  if (!Array.isArray(data)) throw new Error('manifest.json trên Drive phải là một JSON array')
+  for (const entry of data) {
+    if (!isValidManifestEntry(entry)) {
+      throw new Error('manifest.json trên Drive có entry thiếu hoặc sai kiểu field bắt buộc (original/slug/grid/fileCount)')
+    }
+  }
+  return data as ChapterManifestEntry[]
+}
+
+// Returns the first key that appears twice, or null if all keys are unique.
+// Used to reject an append target whose manifest has ambiguous entries before
+// touching Drive.
+function findDuplicateKey(entries: ChapterManifestEntry[], keyFn: (e: ChapterManifestEntry) => string): string | null {
+  const seen = new Set<string>()
+  for (const entry of entries) {
+    const k = keyFn(entry)
+    if (seen.has(k)) return k
+    seen.add(k)
+  }
+  return null
 }
 
 // Copy the non-image files sitting directly at the input root (metadata.json,
@@ -346,48 +397,31 @@ export default function AdminScrambleTab() {
     const chapters: { name: string; handle: FileSystemDirectoryHandle }[] =
       subDirs.length > 0 ? subDirs : [{ name: inputDir!.name, handle: inputDir! }]
 
-    // Pre-count total files for the progress bar.
+    // Collect chapters that actually contain images.
     const chapterFiles: { name: string; handle: FileSystemDirectoryHandle; files: { name: string; handle: FileSystemFileHandle }[] }[] = []
-    let grandTotal = 0
     for (const ch of chapters) {
       const files = await readImageFiles(ch.handle)
       if (files.length === 0) continue
       chapterFiles.push({ ...ch, files })
-      grandTotal += files.length
     }
-    setTotal(grandTotal)
-    if (grandTotal === 0) { message.warning('Không tìm thấy ảnh trong folder'); return }
+    if (chapterFiles.length === 0) { message.warning('Không tìm thấy ảnh trong folder'); return }
 
-    // Drive output must mirror the sync folder concept so sync ingests it with NO
-    // code change: <shared run root>/<manga name>/<slug chapter>/NNN.png, with
-    // manifest.json + copied metadata/cover at the manga-folder root. Sync lists
-    // root → mangas → chapters, so the shared/auto-added root folder is the run root
-    // and the manga folder sits one level down. The manga folder takes the original
-    // input folder name so the manga keeps its title/cover after sync.
-    // Drive output must mirror the sync folder concept so sync ingests it with NO
-    // code change.
-    //  - 'new':    <run root>/<manga name>/<slug chapter>/NNN.png  (fresh manga)
-    //  - 'append': <picked manga folder>/<slug chapter>/NNN.png    (existing manga)
-    // In append mode the picked folder IS the manga folder (its DriveFileId is
-    // already in the DB from the first sync), so new slug subfolders land beside the
-    // old ones and sync picks them up as new chapters. shareThisId is what we grant
-    // the service account: the run root ('new') cascades to children; in 'append'
-    // the manga folder is already shared, but we re-share it (idempotent) to be safe.
-    const appendMode = dest === 'drive' && driveMode === 'append'
-    let driveRootId: string | null = null
-    let driveMangaId: string | null = null
-    let shareThisId: string | null = null
-    if (dest === 'drive') {
-      if (appendMode) {
-        driveMangaId = driveTarget!.id
-        shareThisId = driveTarget!.id
-      } else {
-        const runName = `scramble-${new Date().toISOString().replace(/[:.]/g, '-')}`
-        driveRootId = await createDriveFolder(runName)
-        driveMangaId = await createDriveFolder(inputDir!.name, driveRootId)
-        shareThisId = driveRootId
-      }
+    if (dest === 'local') {
+      await runScrambleLocal(chapterFiles)
+      return
     }
+
+    await runScrambleDrive(chapterFiles)
+  }
+
+  // Local scramble: unchanged from the original flow — process every chapter,
+  // write manifest.json once at the end. No skip/resume logic; local runs are
+  // fast enough that resuming a partial run isn't worth the complexity here.
+  const runScrambleLocal = async (
+    chapterFiles: { name: string; handle: FileSystemDirectoryHandle; files: { name: string; handle: FileSystemFileHandle }[] }[],
+  ) => {
+    const grandTotal = chapterFiles.reduce((sum, ch) => sum + ch.files.length, 0)
+    setTotal(grandTotal)
 
     const manifest: ChapterManifestEntry[] = []
     let processed = 0
@@ -399,13 +433,129 @@ export default function AdminScrambleTab() {
       const key = await deriveChapterKey(masterKey.trim(), slug)
       setCurrentLabel(`${ch.name} → ${slug}`)
 
-      // Output target for this chapter: a local dir handle, or a Drive folder id.
-      const outChapterDir = dest === 'local'
-        ? await outputDir!.getDirectoryHandle(slug, { create: true })
-        : null
-      const driveChapterId = dest === 'drive'
-        ? await createDriveFolder(slug, driveMangaId!)
-        : null
+      const outChapterDir = await outputDir!.getDirectoryHandle(slug, { create: true })
+      const numbered = ch.files.map((file, i) => ({ file, seq: i + 1 }))
+
+      for (const { file, seq } of numbered) {
+        if (cancelledRef.current) break
+        const blob = await file.handle.getFile()
+        const bitmap = await createImageBitmap(blob)
+        try {
+          const perm = generatePermutation(key, grid)
+          const outBlob = await processToBlob(bitmap, perm, grid)
+          const fileName = `${String(seq).padStart(3, '0')}.png`
+          const fileHandle = await outChapterDir.getFileHandle(fileName, { create: true })
+          const writable = await fileHandle.createWritable()
+          await writable.write(outBlob)
+          await writable.close()
+        } finally {
+          bitmap.close()
+        }
+        processed++
+        setDone(processed)
+      }
+      manifest.push({ original: ch.name, slug, grid, fileCount: ch.files.length })
+    }
+
+    if (cancelledRef.current) { message.info('Đã hủy'); return }
+
+    const manifestHandle = await outputDir!.getFileHandle('manifest.json', { create: true })
+    const manifestWritable = await manifestHandle.createWritable()
+    await manifestWritable.write(JSON.stringify(manifest, null, 2))
+    await manifestWritable.close()
+
+    message.success(`Hoàn thành! ${manifest.length} chapter, ${processed} ảnh đã xáo.`)
+  }
+
+  // Drive scramble: checkpoints manifest.json after every chapter so a failed or
+  // cancelled run can be safely re-run — chapters already checkpointed (same
+  // `original` + `fileCount`, and their slug folder still present) are skipped
+  // instead of being re-uploaded under a new slug.
+  const runScrambleDrive = async (
+    chapterFiles: { name: string; handle: FileSystemDirectoryHandle; files: { name: string; handle: FileSystemFileHandle }[] }[],
+  ) => {
+    // Drive output must mirror the sync folder concept so sync ingests it with NO
+    // code change.
+    //  - 'new':    <run root>/<manga name>/<slug chapter>/NNN.png  (fresh manga)
+    //  - 'append': <picked manga folder>/<slug chapter>/NNN.png    (existing manga)
+    // In append mode the picked folder IS the manga folder (its DriveFileId is
+    // already in the DB from the first sync), so new slug subfolders land beside the
+    // old ones and sync picks them up as new chapters. shareThisId is what we grant
+    // the service account: the run root ('new') cascades to children; in 'append'
+    // the manga folder is already shared.
+    const appendMode = driveMode === 'append'
+    let driveMangaId: string
+    let shareThisId: string
+    let manifestFileId: string
+    let existingEntries: ChapterManifestEntry[] = []
+
+    if (appendMode) {
+      driveMangaId = driveTarget!.id
+      shareThisId = driveTarget!.id
+      const existingId = await findChildByName(driveMangaId, 'manifest.json')
+      if (!existingId) {
+        throw new Error('Không tìm thấy manifest.json trong manga đích — chỉ có thể thêm chapter vào manga do chính tool này scramble trước đó.')
+      }
+      existingEntries = parseManifestStrict(await downloadDriveFileText(existingId))
+      const dupOriginal = findDuplicateKey(existingEntries, e => e.original)
+      if (dupOriginal) throw new Error(`manifest.json trên Drive có nhiều entry cùng tên chapter "${dupOriginal}" — không rõ entry nào đúng, dừng lại để tránh ghi đè sai.`)
+      const dupSlug = findDuplicateKey(existingEntries, e => e.slug)
+      if (dupSlug) throw new Error(`manifest.json trên Drive có nhiều entry cùng slug "${dupSlug}" — dừng lại để tránh ghi đè sai.`)
+      manifestFileId = existingId
+    } else {
+      const runName = `scramble-${new Date().toISOString().replace(/[:.]/g, '-')}`
+      const driveRootId = await createDriveFolder(runName)
+      driveMangaId = await createDriveFolder(inputDir!.name, driveRootId)
+      shareThisId = driveRootId
+      // Checkpoint file created up front (empty array) so every chapter update
+      // below is a PATCH to a stable file id, never a fresh upload.
+      manifestFileId = await uploadDriveFile('manifest.json', new Blob([JSON.stringify([], null, 2)], { type: 'application/json' }), driveMangaId)
+      // Copy the non-image root files (metadata.json, cover/banner) verbatim so the
+      // synced manga keeps its title/cover. Chapter images live in slug subfolders,
+      // so anything at the input root is metadata to carry over.
+      await copyRootFilesToDrive(inputDir!, driveMangaId)
+    }
+
+    // Preflight: decide which chapters are already checkpointed vs. need upload.
+    // A chapter is considered done only if the manifest entry's fileCount matches
+    // the current input AND its slug folder is still actually present on Drive —
+    // a stale entry pointing at a deleted folder must not be trusted as "done".
+    const byOriginal = new Map(existingEntries.map(e => [e.original, e]))
+    const plan: { ch: typeof chapterFiles[number]; skip: boolean }[] = []
+    for (const ch of chapterFiles) {
+      const existing = byOriginal.get(ch.name)
+      if (!existing) {
+        plan.push({ ch, skip: false })
+        continue
+      }
+      if (existing.fileCount !== ch.files.length) {
+        throw new Error(`Chapter "${ch.name}" đã có trong manifest (${existing.fileCount} ảnh) nhưng folder input hiện có ${ch.files.length} ảnh. Chưa hỗ trợ thay thế chapter đã upload — cần xử lý thủ công.`)
+      }
+      const folderId = await findChildByName(driveMangaId, existing.slug, DRIVE_FOLDER_MIME)
+      if (!folderId) {
+        throw new Error(`Chapter "${ch.name}" có entry trong manifest (slug ${existing.slug}) nhưng folder đó không còn trên Drive. Dừng lại — cần kiểm tra thủ công.`)
+      }
+      plan.push({ ch, skip: true })
+    }
+
+    const skippedCount = plan.filter(p => p.skip).length
+    const grandTotal = plan.filter(p => !p.skip).reduce((sum, p) => sum + p.ch.files.length, 0)
+    setTotal(grandTotal)
+    if (skippedCount > 0) setCurrentLabel(`Bỏ qua ${skippedCount} chapter đã có trên Drive...`)
+
+    let processed = 0
+    const manifestEntries = [...existingEntries]
+    startedRef.current = Date.now()
+
+    for (const item of plan) {
+      if (item.skip) continue
+      if (cancelledRef.current) break
+
+      const ch = item.ch
+      const slug = newSlug()
+      const key = await deriveChapterKey(masterKey.trim(), slug)
+      setCurrentLabel(`${ch.name} → ${slug}`)
+      const driveChapterId = await createDriveFolder(slug, driveMangaId)
 
       // Pair each file with its 1-based sequence up front, so output names stay
       // stable (001.png, 002.png…) even when uploads finish out of order.
@@ -419,14 +569,7 @@ export default function AdminScrambleTab() {
           const perm = generatePermutation(key, grid)
           const outBlob = await processToBlob(bitmap, perm, grid)
           const fileName = `${String(seq).padStart(3, '0')}.png`
-          if (dest === 'local') {
-            const fileHandle = await outChapterDir!.getFileHandle(fileName, { create: true })
-            const writable = await fileHandle.createWritable()
-            await writable.write(outBlob)
-            await writable.close()
-          } else {
-            await uploadDriveFile(fileName, outBlob, driveChapterId!)
-          }
+          await uploadDriveFile(fileName, outBlob, driveChapterId)
         } finally {
           bitmap.close()
         }
@@ -436,62 +579,46 @@ export default function AdminScrambleTab() {
         setDone(processed)
       }
 
-      // Local writes hit disk serially; Drive uploads are network-bound, so run
-      // several at once to hide round-trip latency on large chapters.
-      if (dest === 'drive') {
+      try {
         await runPool(numbered, DRIVE_CONCURRENCY, processOne)
-      } else {
-        for (const item of numbered) {
-          if (cancelledRef.current) break
-          await processOne(item)
-        }
+      } catch (e) {
+        // Upload failed partway through this chapter — the folder is incomplete
+        // and has no manifest entry. Trash it so a re-run doesn't leave an orphan
+        // for sync to pick up, and doesn't collide if the admin retries.
+        await trashDriveFile(driveChapterId).catch(cleanupErr => {
+          message.error(`Không tự xóa được folder dở "${slug}" trên Drive, cần xóa tay: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`)
+        })
+        throw e
       }
-      manifest.push({ original: ch.name, slug, grid, fileCount: ch.files.length })
+
+      if (cancelledRef.current) {
+        // Cancelled mid-chapter: same as a failure — no manifest entry, best-effort
+        // trash the partial folder so it isn't left as an unmanifested orphan.
+        await trashDriveFile(driveChapterId).catch(cleanupErr => {
+          message.error(`Không tự xóa được folder dở "${slug}" trên Drive, cần xóa tay: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`)
+        })
+        break
+      }
+
+      // Checkpoint: this chapter is fully uploaded, record it in the manifest and
+      // persist immediately so a later chapter's failure can't lose this progress.
+      manifestEntries.push({ original: ch.name, slug, grid, fileCount: ch.files.length })
+      await updateDriveFileContent(manifestFileId, new Blob([JSON.stringify(manifestEntries, null, 2)], { type: 'application/json' }))
     }
 
-    if (cancelledRef.current) { message.info('Đã hủy'); return }
+    // Share the target even if every chapter was skipped or the run was cancelled
+    // partway — whatever got checkpointed above must still be readable.
+    if (serviceEmail) await shareWithServiceAccount(shareThisId, serviceEmail)
 
-    if (dest === 'local') {
-      const manifestHandle = await outputDir!.getFileHandle('manifest.json', { create: true })
-      const manifestWritable = await manifestHandle.createWritable()
-      await manifestWritable.write(JSON.stringify(manifest, null, 2))
-      await manifestWritable.close()
-    } else if (appendMode) {
-      // Append: the manga folder already holds a manifest.json covering the
-      // existing chapters. Sync sets each Chapter's Slug/Grid FROM the manifest, so
-      // the manifest MUST list every chapter (old + new) — otherwise the old ones
-      // lose their entry and the reader 409s (SLUG_MISSING). Download the existing
-      // manifest, append the new entries, and overwrite it IN PLACE (same file id,
-      // so sync doesn't treat it as a churned file). Metadata/cover are already in
-      // the folder from the first run, so we don't re-copy them.
-      const existingId = await findChildByName(driveMangaId!, 'manifest.json')
-      let merged = manifest
-      if (existingId) {
-        const prev = JSON.parse(await downloadDriveFileText(existingId)) as ChapterManifestEntry[]
-        merged = [...prev, ...manifest]
-        await updateDriveFileContent(existingId, new Blob([JSON.stringify(merged, null, 2)], { type: 'application/json' }))
-      } else {
-        await uploadDriveFile('manifest.json', new Blob([JSON.stringify(merged, null, 2)], { type: 'application/json' }), driveMangaId!)
-      }
-      // Re-share (idempotent) so the newly created chapter subfolders are covered.
-      if (serviceEmail) await shareWithServiceAccount(shareThisId!, serviceEmail)
-    } else {
-      // manifest.json + metadata/cover go at the MANGA-folder root (not the run
-      // root): sync reads them from the manga folder (ListFilesAsync(manga.DriveFileId)).
-      await uploadDriveFile('manifest.json', new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }), driveMangaId!)
-      // Copy the non-image root files (metadata.json, cover/banner) verbatim so the
-      // synced manga keeps its title/cover. Chapter images live in slug subfolders,
-      // so anything at the input root is metadata to carry over.
-      await copyRootFilesToDrive(inputDir!, driveMangaId!)
-      // Grant the read-only service account access so /api/images can serve tiles.
-      // Sharing the run root cascades to the manga folder and every chapter subfolder.
-      if (serviceEmail) await shareWithServiceAccount(shareThisId!, serviceEmail)
+    const newCount = manifestEntries.length - existingEntries.length
+    if (cancelledRef.current) {
+      message.info(`Đã hủy. ${newCount} chapter mới đã checkpoint (${processed} ảnh) — chạy lại sẽ bỏ qua các chapter này.`)
+      return
     }
 
     message.success(
-      dest === 'drive'
-        ? `Hoàn thành! ${manifest.length} chapter, ${processed} ảnh đã xáo & upload lên Drive.`
-        : `Hoàn thành! ${manifest.length} chapter, ${processed} ảnh đã xáo.`
+      `Hoàn thành! ${newCount} chapter mới (${processed} ảnh) đã xáo & upload lên Drive.`
+      + (skippedCount > 0 ? ` Bỏ qua ${skippedCount} chapter đã có.` : '')
     )
   }
 
