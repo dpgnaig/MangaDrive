@@ -44,13 +44,6 @@ export default function Onboarding() {
   const birthdayError = validateBirthday(birthday)
   const profileValid = !!displayName.trim() && !birthdayError
 
-  // Admin step: master password
-  const [pwStatusLoading, setPwStatusLoading] = useState(true)
-  const [pwSet, setPwSet] = useState(false)
-  const [pwNew, setPwNew] = useState('')
-  const [pwConfirm, setPwConfirm] = useState('')
-  const [pwSaving, setPwSaving] = useState(false)
-
   // Admin step: banner
   const [banner, setBanner] = useState('')
   const [bannerSaving, setBannerSaving] = useState(false)
@@ -60,8 +53,7 @@ export default function Onboarding() {
   const [syncing, setSyncing] = useState(false)
 
   useEffect(() => {
-    if (!isAdmin) { setPwStatusLoading(false); return }
-    api.get('/settings/master-password/status').then(r => setPwSet(!!r.data?.isSet)).catch(() => {}).finally(() => setPwStatusLoading(false))
+    if (!isAdmin) return
     api.get('/settings/announcement').then(r => setBanner(r.data || '')).catch(() => {})
     api.get('/admin/root-folders').then(r => setSourceCount(r.data.length)).catch(() => {})
   }, [isAdmin])
@@ -83,23 +75,6 @@ export default function Onboarding() {
       message.error('Lưu hồ sơ thất bại')
     }
     setSaving(false)
-  }
-
-  const saveMasterPassword = async () => {
-    if (!pwNew.trim()) { message.warning('Vui lòng nhập master password'); return false }
-    if (pwNew !== pwConfirm) { message.warning('Mật khẩu xác nhận không khớp'); return false }
-    setPwSaving(true)
-    try {
-      await api.post('/settings/master-password', { newPassword: pwNew })
-      setPwSet(true)
-      message.success('Đã đặt master password')
-      return true
-    } catch (e: any) {
-      message.error(e?.response?.data?.message || 'Đặt master password thất bại')
-      return false
-    } finally {
-      setPwSaving(false)
-    }
   }
 
   const saveBanner = async () => {
@@ -148,30 +123,6 @@ export default function Onboarding() {
             </p>
           )}
         </div>
-      </div>
-    ),
-  }
-
-  const masterPasswordStep = {
-    key: 'master-password',
-    title: 'Master password',
-    content: pwStatusLoading ? (
-      <div style={{ textAlign: 'center', padding: 40 }}><span className="ms spin" style={{ fontSize: 24, color: 'var(--accent)' }}>progress_activity</span></div>
-    ) : (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        <p style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
-          Master password dùng cho công cụ scramble ảnh. Hash lưu ở server chỉ để kiểm tra bạn gõ đúng, không giải mã được.
-        </p>
-        {pwSet ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--green)' }}>
-            <span className="ms" style={{ fontSize: 18 }}>check_circle</span> Master password đã được đặt.
-          </div>
-        ) : (
-          <>
-            <Input.Password value={pwNew} onChange={e => setPwNew(e.target.value)} placeholder="Master password" disabled={pwSaving} />
-            <Input.Password value={pwConfirm} onChange={e => setPwConfirm(e.target.value)} placeholder="Xác nhận master password" disabled={pwSaving} />
-          </>
-        )}
       </div>
     ),
   }
@@ -228,23 +179,19 @@ export default function Onboarding() {
     ),
   }
 
-  // Everyone gets profile + finish; admins get the three setup steps in between.
+  // Everyone gets profile + finish; admins get the two setup steps in between.
   const steps = isAdmin
-    ? [profileStep, masterPasswordStep, bannerStep, syncStep, finishStep]
+    ? [profileStep, bannerStep, syncStep, finishStep]
     : [profileStep, finishStep]
 
   const stepKey = steps[current].key
   const isLast = current === steps.length - 1
 
-  // Gate advancing per step: profile must be valid; master password must be set.
-  const handleNext = async () => {
+  // Gate advancing per step: profile must be valid.
+  const handleNext = () => {
     if (stepKey === 'profile') {
       setBirthdayTouched(true)
       if (!profileValid) return
-    }
-    if (stepKey === 'master-password' && !pwSet) {
-      const ok = await saveMasterPassword()
-      if (!ok) return
     }
     setCurrent(c => c + 1)
   }
@@ -265,11 +212,11 @@ export default function Onboarding() {
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 20 }}>
-          <Button onClick={() => setCurrent(c => c - 1)} disabled={current === 0 || saving || pwSaving} style={{ borderRadius: 20, height: 40 }}>Quay lại</Button>
+          <Button onClick={() => setCurrent(c => c - 1)} disabled={current === 0 || saving} style={{ borderRadius: 20, height: 40 }}>Quay lại</Button>
           {isLast ? (
             <Button type="primary" onClick={finishProfile} loading={saving} style={{ borderRadius: 20, height: 40 }}>Hoàn tất</Button>
           ) : (
-            <Button type="primary" onClick={handleNext} loading={pwSaving} style={{ borderRadius: 20, height: 40 }}>Tiếp</Button>
+            <Button type="primary" onClick={handleNext} style={{ borderRadius: 20, height: 40 }}>Tiếp</Button>
           )}
         </div>
       </div>

@@ -223,19 +223,7 @@ export default function AdminScrambleTab() {
   const [previewReady, setPreviewReady] = useState(false)
   const [previewing, setPreviewing] = useState(false)
 
-  // Master password: hash stored server-side, verify-only. Used to catch typos
-  // in the master key (a mistyped key produces unrecoverable output).
-  const [pwStatusLoading, setPwStatusLoading] = useState(true)
-  const [isPwSet, setIsPwSet] = useState(false)
-  const [pwCurrent, setPwCurrent] = useState('')
-  const [pwNew, setPwNew] = useState('')
-  const [pwSaving, setPwSaving] = useState(false)
-
   useEffect(() => {
-    api.get('/settings/master-password/status')
-      .then(r => setIsPwSet(!!r.data?.isSet))
-      .catch(() => {})
-      .finally(() => setPwStatusLoading(false))
     // Service account email is needed so uploaded folders can be shared back to
     // the read-only account that /api/images proxies through.
     api.get('/admin/drive/service-account')
@@ -288,24 +276,6 @@ export default function AdminScrambleTab() {
     setPicking(false)
   }
 
-  const savePassword = async () => {
-    if (!pwNew.trim()) { message.warning('Vui lòng nhập master password mới'); return }
-    setPwSaving(true)
-    try {
-      await api.post('/settings/master-password', {
-        currentPassword: isPwSet ? pwCurrent : undefined,
-        newPassword: pwNew,
-      })
-      message.success(isPwSet ? 'Đã đổi master password' : 'Đã đặt master password')
-      setIsPwSet(true)
-      setPwCurrent('')
-      setPwNew('')
-    } catch (e: any) {
-      message.error(e?.response?.data?.message || 'Lưu master password thất bại')
-    }
-    setPwSaving(false)
-  }
-
   const pickInput = async () => {
     try {
       const handle = await window.showDirectoryPicker({ id: 'scramble-input' })
@@ -321,15 +291,15 @@ export default function AdminScrambleTab() {
     } catch { /* user cancelled */ }
   }
 
-  // Verify the typed key against the stored hash. A mistyped key would produce
-  // output that can never be reversed, so we block before touching any files.
+  // Validate the typed key against the server-only Scramble:MasterKey before
+  // touching any files. The key remains in env config and is never returned.
   const verifyKey = async (): Promise<boolean> => {
     try {
       const { data } = await api.post('/settings/master-password/verify', { password: masterKey.trim() })
-      if (!data?.valid) { message.error('Master password không khớp'); return false }
+      if (!data?.valid) { message.error('Master key không khớp với cấu hình server'); return false }
       return true
     } catch {
-      message.error('Không xác thực được master password'); return false
+      message.error('Không xác thực được master key'); return false
     }
   }
 
@@ -722,7 +692,6 @@ export default function AdminScrambleTab() {
   }
 
   const start = async () => {
-    if (!isPwSet) { message.warning('Vui lòng đặt master password trước'); return }
     if (!masterKey.trim()) { message.warning('Vui lòng nhập master key'); return }
     if (!inputDir) { message.warning('Vui lòng chọn folder input'); return }
     // Unscramble always writes local. Scramble writes local OR to Drive.
@@ -767,43 +736,6 @@ export default function AdminScrambleTab() {
       {!supported && (
         <div style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 12, padding: 16, marginBottom: 16, color: 'var(--text-muted)', fontSize: 13 }}>
           Trình duyệt không hỗ trợ File System Access API. Vui lòng dùng Chrome hoặc Edge trên desktop.
-        </div>
-      )}
-
-      {/* Master password: set once (hash stored server-side), then required to
-          match on every run so a mistyped key can't produce garbage. */}
-      {!pwStatusLoading && (
-        <div style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 12, padding: 16, marginBottom: 16 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-            <span className="ms" style={{ fontSize: 18, color: 'var(--accent)' }}>lock</span>
-            <span style={{ fontSize: 14, fontWeight: 600 }}>{isPwSet ? 'Đổi master password' : 'Đặt master password'}</span>
-          </div>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>
-            {isPwSet
-              ? 'Master password đã được đặt. Nhập master key đúng với mật khẩu này để scramble/unscramble.'
-              : 'Đặt master password trước khi scramble. Hash lưu ở server chỉ để kiểm tra bạn gõ đúng, không giải mã được.'}
-          </p>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {isPwSet && (
-              <Input.Password
-                value={pwCurrent}
-                onChange={e => setPwCurrent(e.target.value)}
-                placeholder="Master password hiện tại"
-                disabled={pwSaving}
-              />
-            )}
-            <Input.Password
-              value={pwNew}
-              onChange={e => setPwNew(e.target.value)}
-              placeholder={isPwSet ? 'Master password mới' : 'Master password'}
-              disabled={pwSaving}
-            />
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <Button type="primary" onClick={savePassword} loading={pwSaving} style={{ borderRadius: 20, height: 36 }}>
-                {isPwSet ? 'Đổi' : 'Đặt'}
-              </Button>
-            </div>
-          </div>
         </div>
       )}
 

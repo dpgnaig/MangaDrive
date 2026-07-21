@@ -1,5 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
 using MangaDrive.Api.Filters;
-using MangaDrive.Api.Security;
 using MangaDrive.Core.Entities;
 using MangaDrive.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
@@ -9,7 +10,6 @@ using Microsoft.EntityFrameworkCore;
 namespace MangaDrive.Api.Controllers;
 
 public record UpdateAnnouncementRequest(string Value);
-public record SetMasterPasswordRequest(string? CurrentPassword, string NewPassword);
 public record VerifyMasterPasswordRequest(string Password);
 
 [ApiController]
@@ -17,8 +17,13 @@ public record VerifyMasterPasswordRequest(string Password);
 public class SettingsController : ControllerBase
 {
     private readonly AppDbContext _db;
+    private readonly IConfiguration _config;
 
-    public SettingsController(AppDbContext db) => _db = db;
+    public SettingsController(AppDbContext db, IConfiguration config)
+    {
+        _db = db;
+        _config = config;
+    }
 
     // Public: anyone can read the announcement banner text
     [HttpGet("announcement")]
@@ -48,49 +53,32 @@ public class SettingsController : ControllerBase
         return NoContent();
     }
 
-    // Admin: whether a master password has been set yet
-    [HttpGet("master-password/status")]
-    [Authorize]
-    [RequireAdmin]
-    public async Task<IActionResult> MasterPasswordStatus()
-    {
-        var exists = await _db.Settings.AnyAsync(s => s.Key == "master_password_hash");
-        return Ok(new { isSet = exists });
-    }
-
-    // Admin: set or change the master password. If already set, CurrentPassword must verify.
-    [HttpPost("master-password")]
-    [Authorize]
-    [RequireAdmin]
-    public async Task<IActionResult> SetMasterPassword([FromBody] SetMasterPasswordRequest req)
-    {
-        if (string.IsNullOrEmpty(req.NewPassword))
-            return BadRequest(new { message = "Mật khẩu mới không được để trống" });
-
-        var setting = await _db.Settings.FirstOrDefaultAsync(s => s.Key == "master_password_hash");
-        if (setting != null)
-        {
-            if (string.IsNullOrEmpty(req.CurrentPassword) || !PasswordHasher.Verify(req.CurrentPassword, setting.Value))
-                return BadRequest(new { message = "Master password hiện tại không đúng" });
-            setting.Value = PasswordHasher.Hash(req.NewPassword);
-        }
-        else
-        {
-            setting = new Setting { Key = "master_password_hash", Value = PasswordHasher.Hash(req.NewPassword) };
-            _db.Settings.Add(setting);
-        }
-        await _db.SaveChangesAsync();
-        return NoContent();
-    }
-
-    // Admin: verify a master password against the stored hash
+    // Admin: verify a typed master key against the real Scramble:MasterKey env value.
+    // There's nothing to "set" — the key lives only in server config, never in the DB
+    // or the client bundle, so this is the sole source of truth for the check.
     [HttpPost("master-password/verify")]
     [Authorize]
     [RequireAdmin]
-    public async Task<IActionResult> VerifyMasterPassword([FromBody] VerifyMasterPasswordRequest req)
+    public IActionResult VerifyMasterPassword([FromBody] VerifyMasterPasswordRequest req)
     {
-        var setting = await _db.Settings.FirstOrDefaultAsync(s => s.Key == "master_password_hash");
-        var valid = setting != null && PasswordHasher.Verify(req.Password ?? "", setting.Value);
+        var actualKey = _config["Scramble:MasterKey"] ?? "";
+        var typedKey = req.Password ?? "";
+
+        var actualBytes = Encoding.UTF8.GetBytes(actualKey);
+        var typedBytes = Encoding.UTF8.GetBytes(typedKey);
+
+        // Fixed-time compare needs equal-length buffers; pad the shorter one so the
+        // comparison itself never leaks length via timing, then also check length.
+        var maxLen = Math.Max(actualBytes.Length, typedBytes.Length);
+        var actualPadded = new byte[maxLen];
+        var typedPadded = new byte[maxLen];
+        Array.Copy(actualBytes, actualPadded, actualBytes.Length);
+        Array.Copy(typedBytes, typedPadded, typedBytes.Length);
+
+        var valid = actualBytes.Length == typedBytes.Length
+            && CryptographicOperations.FixedTimeEquals(actualPadded, typedPadded)
+            && actualKey.Length > 0;
+
         return Ok(new { valid });
     }
 }
