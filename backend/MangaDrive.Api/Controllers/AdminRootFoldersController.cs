@@ -259,11 +259,24 @@ public class AdminRootFoldersController : ControllerBase
     /// caller (e.g. the scramble tool, right after it shares a freshly-uploaded manga
     /// folder with the service account) surface a newly-shared root immediately instead
     /// of waiting for the next timer tick.
+    ///
+    /// Retries with backoff: Drive's `sharedWithMe` search index is eventually
+    /// consistent, so a permission that just committed via Permissions.create can take
+    /// several seconds to tens of seconds before it shows up in ListSharedFoldersAsync's
+    /// query. A single immediate scan reliably races that index and comes back empty —
+    /// this loop rides out that window instead of relying solely on the 30-minute timer.
     /// </summary>
     [HttpPost("detect-new-shared")]
     public async Task<IActionResult> DetectNewShared()
     {
-        var queued = await AutoSyncService.DetectNewSharedFolders(_db, _drive, _logger, HttpContext.RequestAborted);
+        var delaysMs = new[] { 0, 3000, 5000, 8000, 15000 };
+        int queued = 0;
+        foreach (var delay in delaysMs)
+        {
+            if (delay > 0) await Task.Delay(delay, HttpContext.RequestAborted);
+            queued = await AutoSyncService.DetectNewSharedFolders(_db, _drive, _logger, HttpContext.RequestAborted);
+            if (queued > 0) break;
+        }
         return Ok(new { queued });
     }
 }
