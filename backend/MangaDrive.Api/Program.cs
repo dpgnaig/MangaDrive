@@ -407,26 +407,40 @@ using (var scope = app.Services.CreateScope())
     try { db.Database.ExecuteSqlRaw("ALTER TABLE Users ADD COLUMN Birthday TEXT"); } catch { }
     try { db.Database.ExecuteSqlRaw("ALTER TABLE Users ADD COLUMN HasChangedName INTEGER NOT NULL DEFAULT 0"); } catch { }
 
-    // Auto-add shared folders from Drive
+    // Auto-add shared folders from Drive. Any folder registered here must also be
+    // queued for sync — otherwise it sits in RootFolders with zero mangas forever:
+    // AutoSyncService.DetectNewSharedFolders runs 2 minutes after startup and skips
+    // any Drive folder ID already present in RootFolders, so if THIS block is the one
+    // that first registers a newly-shared folder (it always runs first, since it's
+    // synchronous at startup vs. AutoSyncService's 2-minute delay), nothing else will
+    // ever trigger its initial sync.
     try
     {
         var drive = scope.ServiceProvider.GetRequiredService<IGoogleDriveService>();
         var sharedFolders = await drive.ListSharedFoldersAsync();
         var existingIds = db.RootFolders.Select(r => r.GoogleDriveFolderId).ToHashSet();
+        var newlyAddedRoots = new List<MangaDrive.Core.Entities.MangaRootFolder>();
         foreach (var sf in sharedFolders)
         {
             if (!existingIds.Contains(sf.Id))
             {
-                db.RootFolders.Add(new MangaDrive.Core.Entities.MangaRootFolder
+                var newRoot = new MangaDrive.Core.Entities.MangaRootFolder
                 {
                     Name = sf.Name,
                     GoogleDriveFolderId = sf.Id,
                     IsPublic = true,
                     IsAutoAdded = true
-                });
+                };
+                db.RootFolders.Add(newRoot);
+                newlyAddedRoots.Add(newRoot);
             }
         }
         db.SaveChanges();
+        foreach (var newRoot in newlyAddedRoots)
+        {
+            await SyncBackgroundService.Queue.Writer.WriteAsync(
+                new SyncRequest(newRoot.Id, SyncRequestType.RootFolder));
+        }
     }
     catch { /* Drive not available at startup - skip */ }
 
