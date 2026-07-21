@@ -61,7 +61,7 @@ public class AutoSyncService : BackgroundService
         int totalQueued = 0;
 
         // === Step 1: Detect new shared root folders ===
-        totalQueued += await DetectNewSharedFolders(db, drive, ct);
+        totalQueued += await DetectNewSharedFolders(db, drive, _logger, ct);
 
         // === Step 2: Get all active root folders ===
         var rootFolders = await db.RootFolders
@@ -252,14 +252,18 @@ public class AutoSyncService : BackgroundService
     /// and removes auto-added root folders that are no longer shared (deleted/unshared
     /// directly on Drive). Manually-added roots (IsAutoAdded == false) are never touched
     /// here — only Drive's shared-folder list governs auto-added ones.
+    ///
+    /// Static + a passed-in logger so this can also be called on-demand from
+    /// AdminRootFoldersController (e.g. right after the scramble tool shares a freshly
+    /// uploaded manga folder) instead of only on AutoSyncService's 30-minute timer.
     /// </summary>
-    private async Task<int> DetectNewSharedFolders(AppDbContext db, IGoogleDriveService drive, CancellationToken ct)
+    public static async Task<int> DetectNewSharedFolders(AppDbContext db, IGoogleDriveService drive, ILogger logger, CancellationToken ct = default)
     {
         int queued = 0;
         try
         {
             var sharedFolders = await drive.ListSharedFoldersAsync();
-            _logger.LogInformation(
+            logger.LogInformation(
                 "Auto sync: Drive returned {Count} shared folder(s): {Names}",
                 sharedFolders.Count,
                 string.Join(", ", sharedFolders.Select(f => $"{f.Name} ({f.Id})")));
@@ -283,7 +287,7 @@ public class AutoSyncService : BackgroundService
                 db.RootFolders.Add(newRoot);
                 await db.SaveChangesAsync(ct);
 
-                _logger.LogInformation("Auto sync: new shared folder '{Name}' detected, added and queueing sync", shared.Name);
+                logger.LogInformation("Auto sync: new shared folder '{Name}' detected, added and queueing sync", shared.Name);
                 await SyncBackgroundService.Queue.Writer.WriteAsync(
                     new SyncRequest(newRoot.Id, SyncRequestType.RootFolder), ct);
                 queued++;
@@ -300,12 +304,12 @@ public class AutoSyncService : BackgroundService
             foreach (var root in goneRoots)
             {
                 await RemoveRootFolderAndContents(db, root, ct);
-                _logger.LogInformation("Auto sync: root folder '{Name}' no longer shared on Drive, removed", root.Name);
+                logger.LogInformation("Auto sync: root folder '{Name}' no longer shared on Drive, removed", root.Name);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogWarning(ex, "Auto sync: failed to scan shared folders");
+            logger.LogWarning(ex, "Auto sync: failed to scan shared folders");
         }
         return queued;
     }

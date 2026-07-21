@@ -633,7 +633,14 @@ export default function AdminScrambleTab() {
 
     // Share the target even if every chapter was skipped, failed, or the run
     // was cancelled partway — whatever got checkpointed above must still be readable.
-    if (serviceEmail) await shareWithServiceAccount(shareThisId, serviceEmail)
+    if (serviceEmail) {
+      await shareWithServiceAccount(shareThisId, serviceEmail)
+      // For "manga mới" this is a brand-new top-level Drive folder the backend has
+      // never seen — without this it stays invisible in Drive Source until
+      // AutoSyncService's 30-minute timer (or a server restart) happens to run.
+      // Best-effort: a failure here just means the admin waits for the timer instead.
+      await api.post('/admin/root-folders/detect-new-shared').catch(() => {})
+    }
 
     const newCount = manifestEntries.length - existingEntries.length
     if (cancelledRef.current) {

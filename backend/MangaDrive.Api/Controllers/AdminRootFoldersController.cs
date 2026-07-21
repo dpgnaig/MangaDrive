@@ -18,11 +18,13 @@ public class AdminRootFoldersController : ControllerBase
 {
     private readonly AppDbContext _db;
     private readonly IGoogleDriveService _drive;
+    private readonly ILogger<AdminRootFoldersController> _logger;
 
-    public AdminRootFoldersController(AppDbContext db, IGoogleDriveService drive)
+    public AdminRootFoldersController(AppDbContext db, IGoogleDriveService drive, ILogger<AdminRootFoldersController> logger)
     {
         _db = db;
         _drive = drive;
+        _logger = logger;
     }
 
     [HttpGet]
@@ -250,5 +252,18 @@ public class AdminRootFoldersController : ControllerBase
         if (folder == null) return NotFound();
         await SyncBackgroundService.Queue.Writer.WriteAsync(new SyncRequest(id, SyncRequestType.RootFolder));
         return Accepted();
+    }
+
+    /// <summary>
+    /// On-demand version of AutoSyncService's 30-minute shared-folder scan. Lets a
+    /// caller (e.g. the scramble tool, right after it shares a freshly-uploaded manga
+    /// folder with the service account) surface a newly-shared root immediately instead
+    /// of waiting for the next timer tick.
+    /// </summary>
+    [HttpPost("detect-new-shared")]
+    public async Task<IActionResult> DetectNewShared()
+    {
+        var queued = await AutoSyncService.DetectNewSharedFolders(_db, _drive, _logger, HttpContext.RequestAborted);
+        return Ok(new { queued });
     }
 }
