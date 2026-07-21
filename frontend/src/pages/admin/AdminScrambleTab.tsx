@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Input, Button, Progress, Select, Segmented, message } from 'antd'
 import { generatePermutation, generateInversePermutation, deriveChapterKey } from '../../lib/scramble'
 import api from '../../lib/api'
-import { connectDrive, disconnectDrive, createDriveFolder, uploadDriveFile, shareWithServiceAccount, pickDriveFolder, findChildByName, downloadDriveFileText, updateDriveFileContent, trashDriveFile, DRIVE_FOLDER_MIME } from '../../lib/googleDrive'
+import { connectDrive, disconnectDrive, createDriveFolder, uploadDriveFile, shareWithServiceAccount, pickDriveFolder, findChildByName, downloadDriveFileText, updateDriveFileContent, trashDriveFile, abortAllDriveRequests, DRIVE_FOLDER_MIME } from '../../lib/googleDrive'
 
 type Dest = 'local' | 'drive'
 
@@ -137,32 +137,30 @@ async function readSubDirs(dir: FileSystemDirectoryHandle): Promise<{ name: stri
 async function readManifest(dir: FileSystemDirectoryHandle): Promise<ChapterManifestEntry[]> {
   const handle = await dir.getFileHandle('manifest.json')
   const text = await (await handle.getFile()).text()
-  return JSON.parse(text)
+  return parseManifestStrict(text)
 }
 
 function isValidManifestEntry(e: unknown): e is ChapterManifestEntry {
   if (typeof e !== 'object' || e === null) return false
   const r = e as Record<string, unknown>
-  return typeof r.original === 'string' && r.original.length > 0 &&
-    typeof r.slug === 'string' && r.slug.length > 0 &&
-    typeof r.grid === 'number' && Number.isFinite(r.grid) &&
-    typeof r.fileCount === 'number' && Number.isFinite(r.fileCount)
+  return typeof r.original === 'string' && r.original.trim().length > 0 &&
+    typeof r.slug === 'string' && r.slug.trim().length > 0 &&
+    typeof r.grid === 'number' && Number.isInteger(r.grid) && r.grid > 1 &&
+    typeof r.fileCount === 'number' && Number.isInteger(r.fileCount) && r.fileCount >= 0
 }
 
-// Parse + validate a Drive manifest.json before trusting it as a checkpoint
-// source for append mode. Throws with a message meant for the admin rather
-// than silently treating malformed/foreign JSON as "no chapters done yet".
 function parseManifestStrict(text: string): ChapterManifestEntry[] {
   let data: unknown
   try {
     data = JSON.parse(text)
   } catch {
-    throw new Error('manifest.json trên Drive không phải JSON hợp lệ')
+    throw new Error('manifest.json không phải JSON hợp lệ')
   }
-  if (!Array.isArray(data)) throw new Error('manifest.json trên Drive phải là một JSON array')
-  for (const entry of data) {
+  if (!Array.isArray(data)) throw new Error('manifest.json phải là một JSON array')
+  for (let i = 0; i < data.length; i++) {
+    const entry = data[i]
     if (!isValidManifestEntry(entry)) {
-      throw new Error('manifest.json trên Drive có entry thiếu hoặc sai kiểu field bắt buộc (original/slug/grid/fileCount)')
+      throw new Error(`manifest.json có entry #${i + 1} không hợp lệ: original/slug phải khác rỗng, grid phải là số nguyên > 1 và fileCount phải là số nguyên >= 0`)
     }
   }
   return data as ChapterManifestEntry[]
@@ -336,8 +334,9 @@ export default function AdminScrambleTab() {
   }
 
   // Draw the first image (original + processed) into the preview canvases.
-  // Scramble mode: uses an illustrative "masterKey:preview" key just to show the grid
-  // effect. Unscramble mode: reads the real slug+grid from manifest.json and reverses
+  // Scramble mode derives an illustrative HMAC key from a fixed preview slug,
+  // following the same Phase 2 pipeline as a real randomly generated slug.
+  // Unscramble mode reads the real slug+grid from manifest.json and reverses
   // the first image of the first chapter — a genuine check that the key unlocks it.
   const doPreview = async () => {
     if (!masterKey.trim()) { message.warning('Vui lòng nhập master key'); return }
@@ -354,10 +353,10 @@ export default function AdminScrambleTab() {
         const files = await readImageFiles(firstDir)
         if (files.length === 0) { message.warning('Không tìm thấy ảnh trong folder'); return }
         fileHandle = files[0].handle
-        perm = generatePermutation(`${masterKey.trim()}:preview`, g)
+        perm = generatePermutation(await deriveChapterKey(masterKey.trim(), 'chapter-preview'), g)
       } else {
-        const manifest = await readManifest(inputDir).catch(() => null)
-        if (!manifest || manifest.length === 0) { message.warning('Không đọc được manifest.json'); return }
+        const manifest = await readManifest(inputDir)
+        if (manifest.length === 0) { message.warning('manifest.json không có chapter'); return }
         const entry = manifest[0]
         g = entry.grid
         const chapterDir = await inputDir.getDirectoryHandle(entry.slug)
@@ -522,7 +521,9 @@ export default function AdminScrambleTab() {
     // a stale entry pointing at a deleted folder must not be trusted as "done".
     const byOriginal = new Map(existingEntries.map(e => [e.original, e]))
     const plan: { ch: typeof chapterFiles[number]; skip: boolean }[] = []
-    for (const ch of chapterFiles) {
+    for (let i = 0; i < chapterFiles.length; i++) {
+      const ch = chapterFiles[i]
+      setCurrentLabel(`Đang kiểm tra "${ch.name}" đã upload chưa... (${i + 1}/${chapterFiles.length})`)
       const existing = byOriginal.get(ch.name)
       if (!existing) {
         plan.push({ ch, skip: false })
@@ -545,6 +546,17 @@ export default function AdminScrambleTab() {
 
     let processed = 0
     const manifestEntries = [...existingEntries]
+    // Chapters that failed to upload — collected instead of aborting the whole
+    // run, so one bad chapter (e.g. a corrupt image) doesn't block the rest.
+    const failedChapters: { name: string; error: string }[] = []
+    // A handful of isolated failures (bad image, transient hiccup) shouldn't
+    // stop the run. But failures in a row usually mean something systemic —
+    // wrong master key, network down, Drive quota — and blindly ploughing
+    // through the rest of the plan just repeats the same failure N times while
+    // burning Drive quota on create+trash. Stop early in that case.
+    const MAX_CONSECUTIVE_FAILURES = 3
+    let consecutiveFailures = 0
+    let stoppedByConsecutiveFailures = false
     startedRef.current = Date.now()
 
     for (const item of plan) {
@@ -555,64 +567,90 @@ export default function AdminScrambleTab() {
       const slug = newSlug()
       const key = await deriveChapterKey(masterKey.trim(), slug)
       setCurrentLabel(`${ch.name} → ${slug}`)
-      const driveChapterId = await createDriveFolder(slug, driveMangaId)
-
-      // Pair each file with its 1-based sequence up front, so output names stay
-      // stable (001.png, 002.png…) even when uploads finish out of order.
-      const numbered = ch.files.map((file, i) => ({ file, seq: i + 1 }))
-
-      const processOne = async ({ file, seq }: { file: { name: string; handle: FileSystemFileHandle }; seq: number }) => {
-        if (cancelledRef.current) return
-        const blob = await file.handle.getFile()
-        const bitmap = await createImageBitmap(blob)
-        try {
-          const perm = generatePermutation(key, grid)
-          const outBlob = await processToBlob(bitmap, perm, grid)
-          const fileName = `${String(seq).padStart(3, '0')}.png`
-          await uploadDriveFile(fileName, outBlob, driveChapterId)
-        } finally {
-          bitmap.close()
-        }
-        // JS is single-threaded; these increments run synchronously after each
-        // await, so no race even with several uploads in flight.
-        processed++
-        setDone(processed)
-      }
 
       try {
-        await runPool(numbered, DRIVE_CONCURRENCY, processOne)
+        const driveChapterId = await createDriveFolder(slug, driveMangaId)
+
+        // Pair each file with its 1-based sequence up front, so output names stay
+        // stable (001.png, 002.png…) even when uploads finish out of order.
+        const numbered = ch.files.map((file, i) => ({ file, seq: i + 1 }))
+
+        const processOne = async ({ file, seq }: { file: { name: string; handle: FileSystemFileHandle }; seq: number }) => {
+          if (cancelledRef.current) return
+          const blob = await file.handle.getFile()
+          const bitmap = await createImageBitmap(blob)
+          try {
+            const perm = generatePermutation(key, grid)
+            const outBlob = await processToBlob(bitmap, perm, grid)
+            const fileName = `${String(seq).padStart(3, '0')}.png`
+            await uploadDriveFile(fileName, outBlob, driveChapterId)
+          } finally {
+            bitmap.close()
+          }
+          // JS is single-threaded; these increments run synchronously after each
+          // await, so no race even with several uploads in flight.
+          processed++
+          setDone(processed)
+        }
+
+        try {
+          await runPool(numbered, DRIVE_CONCURRENCY, processOne)
+        } catch (e) {
+          // Upload failed partway through this chapter — the folder is incomplete
+          // and has no manifest entry. Trash it so a re-run doesn't leave an orphan
+          // for sync to pick up, and doesn't collide if the admin retries.
+          await trashDriveFile(driveChapterId).catch(cleanupErr => {
+            message.error(`Không tự xóa được folder dở "${slug}" trên Drive, cần xóa tay: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`)
+          })
+          throw e
+        }
+
+        if (cancelledRef.current) {
+          // Cancelled mid-chapter: same as a failure — no manifest entry, best-effort
+          // trash the partial folder so it isn't left as an unmanifested orphan.
+          await trashDriveFile(driveChapterId).catch(cleanupErr => {
+            message.error(`Không tự xóa được folder dở "${slug}" trên Drive, cần xóa tay: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`)
+          })
+          break
+        }
+
+        // Checkpoint: this chapter is fully uploaded, record it in the manifest and
+        // persist immediately so a later chapter's failure can't lose this progress.
+        manifestEntries.push({ original: ch.name, slug, grid, fileCount: ch.files.length })
+        await updateDriveFileContent(manifestFileId, new Blob([JSON.stringify(manifestEntries, null, 2)], { type: 'application/json' }))
+        consecutiveFailures = 0
       } catch (e) {
-        // Upload failed partway through this chapter — the folder is incomplete
-        // and has no manifest entry. Trash it so a re-run doesn't leave an orphan
-        // for sync to pick up, and doesn't collide if the admin retries.
-        await trashDriveFile(driveChapterId).catch(cleanupErr => {
-          message.error(`Không tự xóa được folder dở "${slug}" trên Drive, cần xóa tay: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`)
-        })
-        throw e
+        // Record the failure and move on to the next chapter instead of
+        // aborting the entire run — one bad chapter shouldn't block the rest.
+        failedChapters.push({ name: ch.name, error: e instanceof Error ? e.message : String(e) })
+        consecutiveFailures++
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          stoppedByConsecutiveFailures = true
+          break
+        }
       }
-
-      if (cancelledRef.current) {
-        // Cancelled mid-chapter: same as a failure — no manifest entry, best-effort
-        // trash the partial folder so it isn't left as an unmanifested orphan.
-        await trashDriveFile(driveChapterId).catch(cleanupErr => {
-          message.error(`Không tự xóa được folder dở "${slug}" trên Drive, cần xóa tay: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`)
-        })
-        break
-      }
-
-      // Checkpoint: this chapter is fully uploaded, record it in the manifest and
-      // persist immediately so a later chapter's failure can't lose this progress.
-      manifestEntries.push({ original: ch.name, slug, grid, fileCount: ch.files.length })
-      await updateDriveFileContent(manifestFileId, new Blob([JSON.stringify(manifestEntries, null, 2)], { type: 'application/json' }))
     }
 
-    // Share the target even if every chapter was skipped or the run was cancelled
-    // partway — whatever got checkpointed above must still be readable.
+    // Share the target even if every chapter was skipped, failed, or the run
+    // was cancelled partway — whatever got checkpointed above must still be readable.
     if (serviceEmail) await shareWithServiceAccount(shareThisId, serviceEmail)
 
     const newCount = manifestEntries.length - existingEntries.length
     if (cancelledRef.current) {
       message.info(`Đã hủy. ${newCount} chapter mới đã checkpoint (${processed} ảnh) — chạy lại sẽ bỏ qua các chapter này.`)
+      return
+    }
+
+    if (failedChapters.length > 0) {
+      message.error(
+        (stoppedByConsecutiveFailures
+          ? `Dừng sớm vì ${MAX_CONSECUTIVE_FAILURES} chapter liên tiếp lỗi (có thể do master key sai, mất mạng, hoặc hết quota Drive) — kiểm tra rồi chạy lại. `
+          : 'Hoàn thành với lỗi. ')
+        + `${newCount} chapter mới (${processed} ảnh) đã upload thành công`
+        + (skippedCount > 0 ? `, bỏ qua ${skippedCount} chapter đã có` : '')
+        + `. ${failedChapters.length} chapter LỖI, cần chạy lại: `
+        + failedChapters.map(f => `"${f.name}" (${f.error})`).join('; ')
+      , 12)
       return
     }
 
@@ -625,9 +663,9 @@ export default function AdminScrambleTab() {
   const runUnscramble = async () => {
     // Reads <input>/manifest.json; for each entry, key = HMAC(masterKey, slug) + entry.grid
     // restores <input>/<slug>/* back to <output>/<original>/NNN.png.
-    const manifest = await readManifest(inputDir!).catch(() => null)
-    if (!manifest || manifest.length === 0) {
-      message.error('Không tìm thấy manifest.json trong folder input. Unscramble cần folder output do tool tạo ra.')
+    const manifest = await readManifest(inputDir!)
+    if (manifest.length === 0) {
+      message.error('manifest.json không có chapter. Unscramble cần folder output do tool tạo ra.')
       return
     }
 
@@ -705,7 +743,13 @@ export default function AdminScrambleTab() {
     }
   }
 
-  const cancel = () => { cancelledRef.current = true }
+  const cancel = () => {
+    cancelledRef.current = true
+    // A stalled Drive request never rejects on its own (see driveFetch), so
+    // the cancel flag alone can't unstick a run that's frozen mid-await —
+    // abort whatever's in flight so control actually returns to the loop.
+    abortAllDriveRequests()
+  }
 
   const supported = typeof window !== 'undefined' && 'showDirectoryPicker' in window
 
@@ -770,7 +814,7 @@ export default function AdminScrambleTab() {
 
         <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>
           {mode === 'scramble'
-            ? 'Xáo ảnh local trước khi upload. Mỗi thư mục con = 1 chapter, xáo bằng key riêng (masterKey:slug). Kết quả ghi PNG kèm manifest.json.'
+            ? 'Xáo ảnh local trước khi upload. Mỗi thư mục con = 1 chapter, dùng khóa riêng dẫn xuất bằng HMAC-SHA256(master key, slug). Kết quả ghi PNG kèm manifest.json.'
             : 'Khôi phục ảnh đã xáo. Folder input phải chứa manifest.json (do tool scramble tạo). Kết quả ghi ra <output>/<tên chapter gốc>/NNN.png.'}
         </p>
 
@@ -905,7 +949,7 @@ export default function AdminScrambleTab() {
           </div>
           {mode === 'scramble' && previewReady && (
             <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: 0 }}>
-              Preview dùng khóa minh hoạ ":preview" — slug thật sinh ngẫu nhiên khi chạy, nên ảnh xáo thực tế sẽ khác.
+              Preview dùng slug cố định "chapter-preview" với cùng HMAC-SHA256 như Phase 2; slug thật sinh ngẫu nhiên khi chạy nên ảnh xáo thực tế sẽ khác.
             </p>
           )}
 

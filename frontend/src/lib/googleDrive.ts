@@ -94,6 +94,25 @@ let accessToken: string | null = null
 let tokenExpiry = 0
 let connectedEmail: string | null = null
 
+// Default timeout for a single Drive fetch. Without this, a stalled request
+// (dropped connection, silent Google throttling) never resolves or rejects,
+// hanging every caller — runPool, the preflight loop, everything — with no
+// console output at all. uploadDriveFile/updateDriveFileContent pass a longer
+// timeout since their payloads (scrambled page images) are much larger.
+const DEFAULT_TIMEOUT_MS = 20_000
+// Uploads carry scrambled page images / manifest bodies, much larger than a
+// metadata call — give them more room before treating the connection as stuck.
+const UPLOAD_TIMEOUT_MS = 60_000
+
+// In-flight request controllers, tracked so the UI's cancel button can abort
+// a request that's already stuck — cancelledRef checks between awaits can't
+// reach a fetch that never settles. driveFetch adds/removes its own controller.
+const activeControllers = new Set<AbortController>()
+
+export function abortAllDriveRequests(): void {
+  for (const c of activeControllers) c.abort()
+}
+
 export function getConnectedEmail(): string | null {
   return connectedEmail
 }
@@ -104,14 +123,26 @@ export function isDriveConnected(): boolean {
 
 // Request an access token. forceSelect shows the account chooser (manual account
 // switch); otherwise Google may reuse the last-consented account silently.
-async function requestToken(forceSelect: boolean): Promise<string> {
+// Guarded by a timeout: if the GIS consent UI never fires its callback (e.g. no
+// user-gesture context left, mid-run auto-refresh), this would otherwise hang
+// forever with no error — every Drive call routes through ensureToken() here.
+async function requestToken(forceSelect: boolean, timeoutMs = 45_000): Promise<string> {
   await loadGis()
   const oauth2 = window.google!.accounts.oauth2
   return new Promise<string>((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new Error(`Yêu cầu quyền truy cập Drive quá thời gian chờ (${timeoutMs / 1000}s) — có thể popup xin quyền bị chặn hoặc đã đóng`))
+    }, timeoutMs)
     const client = oauth2.initTokenClient({
       client_id: CLIENT_ID,
       scope: SCOPE,
       callback: resp => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
         if (resp.error || !resp.access_token) {
           reject(new Error(resp.error || 'Không lấy được quyền truy cập Drive'))
           return
@@ -127,15 +158,20 @@ async function requestToken(forceSelect: boolean): Promise<string> {
 }
 
 async function fetchConnectedEmail(token: string): Promise<string | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
   try {
     const r = await fetch('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)', {
       headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
     })
     if (!r.ok) return null
     const data = await r.json()
     return data?.user?.emailAddress ?? null
   } catch {
     return null
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -165,16 +201,37 @@ async function ensureToken(forceRefresh = false): Promise<string> {
 
 // Wrapper around fetch for Drive API calls. Surfaces Google's real error body
 // (not just the status code) and, on 401 (token expired/invalidated mid-run),
-// silently re-requests a token once and retries before giving up.
+// silently re-requests a token once and retries before giving up. Every
+// request gets its own AbortController, tracked in activeControllers and
+// bounded by timeoutMs — otherwise a stalled connection hangs the caller
+// forever with no error, and the cancel button has nothing to abort.
 async function driveFetch(
-  makeRequest: (token: string) => Promise<Response>,
+  makeRequest: (token: string, signal: AbortSignal) => Promise<Response>,
   errLabel: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<Response> {
+  const runOnce = async (token: string): Promise<Response> => {
+    const controller = new AbortController()
+    activeControllers.add(controller)
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      return await makeRequest(token, controller.signal)
+    } catch (e) {
+      if (controller.signal.aborted) {
+        throw new Error(`${errLabel} (quá thời gian chờ ${timeoutMs / 1000}s hoặc đã hủy)`)
+      }
+      throw e
+    } finally {
+      clearTimeout(timer)
+      activeControllers.delete(controller)
+    }
+  }
+
   let token = await ensureToken()
-  let r = await makeRequest(token)
+  let r = await runOnce(token)
   if (r.status === 401) {
     token = await ensureToken(true)
-    r = await makeRequest(token)
+    r = await runOnce(token)
   }
   if (!r.ok) {
     const detail = await r.text().catch(() => '')
@@ -191,10 +248,11 @@ export async function createDriveFolder(name: string, parentId?: string): Promis
   }
   if (parentId) body.parents = [parentId]
   const r = await driveFetch(
-    token => fetch('https://www.googleapis.com/drive/v3/files?fields=id', {
+    (token, signal) => fetch('https://www.googleapis.com/drive/v3/files?fields=id', {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal,
     }),
     'Tạo folder Drive thất bại',
   )
@@ -205,7 +263,7 @@ export async function createDriveFolder(name: string, parentId?: string): Promis
 export async function uploadDriveFile(name: string, blob: Blob, parentId: string): Promise<string> {
   const metadata = { name, parents: [parentId] }
   const r = await driveFetch(
-    token => {
+    (token, signal) => {
       const form = new FormData()
       form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }))
       form.append('file', blob)
@@ -215,10 +273,12 @@ export async function uploadDriveFile(name: string, blob: Blob, parentId: string
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
           body: form,
+          signal,
         },
       )
     },
     'Upload ảnh lên Drive thất bại',
+    UPLOAD_TIMEOUT_MS,
   )
   return (await r.json()).id
 }
@@ -228,12 +288,13 @@ export async function uploadDriveFile(name: string, blob: Blob, parentId: string
 // permissions cascade to children, so sharing the run's root folder is enough.
 export async function shareWithServiceAccount(fileId: string, serviceEmail: string): Promise<void> {
   await driveFetch(
-    token => fetch(
+    (token, signal) => fetch(
       `https://www.googleapis.com/drive/v3/files/${fileId}/permissions?sendNotificationEmail=false`,
       {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ role: 'reader', type: 'user', emailAddress: serviceEmail }),
+        signal,
       },
     ),
     'Chia sẻ folder cho service account thất bại',
@@ -283,9 +344,9 @@ export async function findChildByName(parentId: string, name: string, mimeType?:
   let q = `'${parentId}' in parents and name = '${name.replace(/'/g, "\\'")}' and trashed = false`
   if (mimeType) q += ` and mimeType = '${mimeType}'`
   const r = await driveFetch(
-    token => fetch(
+    (token, signal) => fetch(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)`,
-      { headers: { Authorization: `Bearer ${token}` } },
+      { headers: { Authorization: `Bearer ${token}` }, signal },
     ),
     'Tìm file trên Drive thất bại',
   )
@@ -302,12 +363,13 @@ export const DRIVE_FOLDER_MIME = 'application/vnd.google-apps.folder'
 // upload, so a re-run doesn't leave an orphan folder for sync to pick up.
 export async function trashDriveFile(fileId: string): Promise<void> {
   await driveFetch(
-    token => fetch(
+    (token, signal) => fetch(
       `https://www.googleapis.com/drive/v3/files/${fileId}`,
       {
         method: 'PATCH',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ trashed: true }),
+        signal,
       },
     ),
     'Xóa folder dở trên Drive thất bại',
@@ -317,9 +379,9 @@ export async function trashDriveFile(fileId: string): Promise<void> {
 // Download a Drive file's raw text content (used to read the existing manifest.json).
 export async function downloadDriveFileText(fileId: string): Promise<string> {
   const r = await driveFetch(
-    token => fetch(
+    (token, signal) => fetch(
       `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-      { headers: { Authorization: `Bearer ${token}` } },
+      { headers: { Authorization: `Bearer ${token}` }, signal },
     ),
     'Đọc file trên Drive thất bại',
   )
@@ -330,14 +392,16 @@ export async function downloadDriveFileText(fileId: string): Promise<string> {
 // sync sees the manifest update without treating it as a new file).
 export async function updateDriveFileContent(fileId: string, blob: Blob): Promise<void> {
   await driveFetch(
-    token => fetch(
+    (token, signal) => fetch(
       `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
       {
         method: 'PATCH',
         headers: { Authorization: `Bearer ${token}` },
         body: blob,
+        signal,
       },
     ),
     'Cập nhật file trên Drive thất bại',
+    UPLOAD_TIMEOUT_MS,
   )
 }
