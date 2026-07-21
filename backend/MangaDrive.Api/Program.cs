@@ -10,8 +10,20 @@ using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// "Foreign Keys=True" turns on SQLite's FK enforcement (off by default), which is
+// what makes the ON DELETE CASCADE clauses already baked into the migrations
+// actually fire. Without it, deleting a RootFolder/Manga leaves every dependent
+// row (Chapters, Comments, Favorites, ...) that isn't explicitly loaded into the
+// EF change tracker orphaned in the DB forever.
 builder.Services.AddDbContext<AppDbContext>(o =>
-    o.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
+{
+    var connectionString = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(
+        builder.Configuration.GetConnectionString("DefaultConnection"))
+    {
+        ForeignKeys = true
+    }.ToString();
+    o.UseSqlite(connectionString);
+});
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(o =>

@@ -87,6 +87,21 @@ public class AdminRootFoldersController : ControllerBase
         }
         await _db.SaveChangesAsync();
 
+        // Explicitly remove dependent data before removing the mangas themselves —
+        // matches AdminMangasController.Delete. Don't rely solely on DB-level cascade
+        // (which requires SQLite FK enforcement to be on) or EF's in-memory cascade
+        // (which only reaches entities actually loaded into the change tracker).
+        var mangaIds = mangasInRoot.Select(m => m.Id).ToList();
+        var chapters = await _db.Chapters.Where(c => mangaIds.Contains(c.MangaId)).ToListAsync();
+        var chapterIds = chapters.Select(c => c.Id).ToList();
+        _db.ChapterImages.RemoveRange(_db.ChapterImages.Where(ci => chapterIds.Contains(ci.ChapterId)));
+        _db.Chapters.RemoveRange(chapters);
+        _db.Comments.RemoveRange(_db.Comments.Where(c => mangaIds.Contains(c.MangaId)));
+        _db.Favorites.RemoveRange(_db.Favorites.Where(f => mangaIds.Contains(f.MangaId)));
+        _db.ReadingHistories.RemoveRange(_db.ReadingHistories.Where(r => mangaIds.Contains(r.MangaId)));
+        _db.UserMangaPermissions.RemoveRange(_db.UserMangaPermissions.Where(p => mangaIds.Contains(p.MangaId)));
+        _db.Mangas.RemoveRange(mangasInRoot);
+
         _db.RootFolders.Remove(folder);
         await _db.SaveChangesAsync();
         return NoContent();
