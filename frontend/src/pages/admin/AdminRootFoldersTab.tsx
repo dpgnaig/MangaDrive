@@ -145,7 +145,25 @@ export default function AdminRootFoldersTab({ showAddModal, onCloseAddModal }: {
       await api.delete(`/admin/mangas/${mangaId}`)
       message.success(`Đã xóa "${title}"`)
       setMangasByRoot(prev => ({ ...prev, [rootId]: prev[rootId].filter(m => m.id !== mangaId) }))
-      setScanResults(prev => prev[rootId] ? { ...prev, [rootId]: { ...prev[rootId], folders: prev[rootId].folders.map(f => f.mangaId === mangaId ? { ...f, synced: false, mangaId: null, mangaTitle: null, lastSynced: null } : f), synced: prev[rootId].synced - 1, notSynced: prev[rootId].notSynced + 1 } } : prev)
+      setScanResults(prev => {
+        const scan = prev[rootId]
+        if (!scan) return prev
+        // Deleted manga may be a synced folder (still on Drive — revert that row back
+        // to "chưa đồng bộ" instead of removing it) or an orphan (already gone from
+        // Drive, only existed as a DB row — remove it outright, nothing to revert to).
+        const wasOrphan = scan.orphans.some(o => o.id === mangaId)
+        return {
+          ...prev,
+          [rootId]: {
+            ...scan,
+            folders: scan.folders.map(f => f.mangaId === mangaId ? { ...f, synced: false, mangaId: null, mangaTitle: null, lastSynced: null } : f),
+            orphans: scan.orphans.filter(o => o.id !== mangaId),
+            synced: wasOrphan ? scan.synced : scan.synced - 1,
+            notSynced: wasOrphan ? scan.notSynced : scan.notSynced + 1,
+            orphanCount: wasOrphan ? scan.orphanCount - 1 : scan.orphanCount,
+          }
+        }
+      })
     } catch { message.error('Xóa thất bại') }
   }
 
