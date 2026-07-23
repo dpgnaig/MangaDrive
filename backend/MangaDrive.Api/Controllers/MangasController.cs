@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using MangaDrive.Api.Filters;
+using MangaDrive.Api.Security;
 using MangaDrive.Core.DTOs;
 using MangaDrive.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
@@ -255,19 +256,9 @@ public class ChaptersController : ControllerBase
             return StatusCode(500, new { code = "SERVER_KEY_MISSING", message = "Máy chủ chưa cấu hình khóa giải mã." });
         }
 
-        var key = DeriveChapterKey(masterKey, chapter.Slug);
+        Response.Headers.CacheControl = "no-store";
+        var key = ChapterKeyDeriver.Derive(masterKey, chapter.Slug);
         return Ok(new { key, grid = chapter.Grid });
-    }
-
-    // HMAC-SHA256(masterKey, slug) as lowercase hex. Must stay byte-identical to the
-    // JS deriveChapterKey (frontend/src/lib/scramble.ts) and the C# tool's
-    // ScrambleAlgorithm.DeriveChapterKey, or the reader can't reverse the permutation.
-    private static string DeriveChapterKey(string masterKey, string slug)
-    {
-        using var hmac = new System.Security.Cryptography.HMACSHA256(
-            System.Text.Encoding.UTF8.GetBytes(masterKey));
-        var sig = hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(slug));
-        return Convert.ToHexString(sig).ToLowerInvariant();
     }
 
     /// <summary>Reader reports a problem with a chapter; notifies every admin.</summary>

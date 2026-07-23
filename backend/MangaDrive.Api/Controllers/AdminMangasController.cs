@@ -45,6 +45,24 @@ public class AdminMangasController : ControllerBase
         return Ok(new { manga.IsHidden });
     }
 
+    // Lets an admin correct the display title before running metadata search — useful
+    // when the Drive folder name has noise (release group tags, language markers) that
+    // throws off AniList/MangaDex matching. Only touches Title; the metadata-apply flow
+    // (AdminMetadataController) remains the path for updating every other field at once.
+    [HttpPatch("{id:guid}/title")]
+    public async Task<IActionResult> UpdateTitle(Guid id, [FromBody] UpdateTitleRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Title)) return BadRequest(new { message = "Tên manga không được để trống" });
+
+        var manga = await _db.Mangas.FindAsync(id);
+        if (manga == null) return NotFound();
+
+        manga.Title = req.Title.Trim();
+        manga.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+        return Ok(new { manga.Id, manga.Title });
+    }
+
     [HttpDelete("{id:guid}")]
     public async Task<IActionResult> Delete(Guid id)
     {
@@ -169,9 +187,13 @@ public class AdminMangasController : ControllerBase
             .Where(c => allMangaIds.Contains(c.MangaId))
             .ToListAsync();
 
-        // Sort by extracted number from chapter name
+        // Prefer ManifestOrder (natural-sort position recorded at scramble time —
+        // see MangaSyncService.ReorderLinkedChapters for why this is more trustworthy
+        // than parsing a number out of Name once chapter names get inconsistent).
+        // Falls back to ExtractNumber for chapters never scrambled, or scrambled
+        // before this field existed.
         var sorted = chapters
-            .OrderBy(c => ExtractNumber(c.Name))
+            .OrderBy(c => c.ManifestOrder ?? (int)ExtractNumber(c.Name))
             .ThenBy(c => c.Name)
             .ToList();
 
@@ -280,3 +302,4 @@ public class AdminMangasController : ControllerBase
 
 public record LinkMangaRequest(Guid TargetMangaId);
 public record ImportChapterNameItem(string Label);
+public record UpdateTitleRequest(string Title);

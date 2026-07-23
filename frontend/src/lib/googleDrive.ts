@@ -2,8 +2,8 @@
 //
 // The admin scrambles images locally, then this module pushes the scrambled
 // output straight to the admin's *personal* Google Drive (Google One 5TB),
-// using the Google Identity Services (GIS) token flow with the drive.file
-// scope. The backend service account stays read-only: after upload we grant it
+// using the Google Identity Services (GIS) token flow with the drive scope.
+// The backend service account stays read-only: after upload we grant it
 // reader permission on the folder so /api/images can keep proxying the tiles.
 //
 // Account switching is manual: connect() with forceSelect shows Google's
@@ -15,12 +15,16 @@ const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string
 // Developer key for the Google Picker. Separate from the OAuth client id — create
 // an API key in the same Google Cloud project and restrict it to the Picker API.
 const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY as string
-// drive.file: create + manage only files this app creates. Narrowest scope that
-// still lets us upload folders/images and share them with the service account.
-// Selecting a folder through the Picker also grants the app drive.file access to
-// that folder and its contents, which is how "add chapters to an existing manga"
-// reaches a folder from a previous run.
-const SCOPE = 'https://www.googleapis.com/auth/drive.file'
+// Full drive scope, not drive.file: drive.file only grants access to files/folders
+// this app itself created (or that the admin explicitly picked via the Picker), so
+// createDriveFolder(name, existingMangaFolderId) on a manga folder from an EARLIER
+// browser session — reused via findOrCreateMangaRootFolder/findChildByName without
+// ever going through the Picker — fails with 403 appNotAuthorizedToChild: the token
+// has no record of being granted access to that folder's children. The full drive
+// scope removes that per-file ACL entirely, so appending chapters into a
+// previously-created "Manga" root/manga folder works across sessions without
+// re-picking it every time.
+const SCOPE = 'https://www.googleapis.com/auth/drive'
 
 interface TokenClient {
   requestAccessToken: (overrides?: { prompt?: string }) => void
@@ -209,11 +213,15 @@ async function driveFetch(
   makeRequest: (token: string, signal: AbortSignal) => Promise<Response>,
   errLabel: string,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
 ): Promise<Response> {
   const runOnce = async (token: string): Promise<Response> => {
     const controller = new AbortController()
     activeControllers.add(controller)
     const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const onExternalAbort = () => controller.abort()
+    if (externalSignal?.aborted) controller.abort()
+    else externalSignal?.addEventListener('abort', onExternalAbort)
     try {
       return await makeRequest(token, controller.signal)
     } catch (e) {
@@ -223,6 +231,7 @@ async function driveFetch(
       throw e
     } finally {
       clearTimeout(timer)
+      externalSignal?.removeEventListener('abort', onExternalAbort)
       activeControllers.delete(controller)
     }
   }
@@ -240,30 +249,62 @@ async function driveFetch(
   return r
 }
 
+// Single shared root that every "manga mới" scramble run uploads into, instead
+// of a fresh scramble-<timestamp> root per run — avoids littering the admin's
+// Drive with one throw-away top-level folder for every upload.
+const MANGA_ROOT_FOLDER_NAME = 'Manga'
+
+// Find the shared "Manga" root at the top of Drive, creating it on first use.
+// Safe to call every run: backend root-folder sync already treats one root as
+// containing many manga subfolders, so reusing this folder across runs just
+// means new manga land beside old ones under the same shared root.
+export async function findOrCreateMangaRootFolder(): Promise<string> {
+  const existing = await findChildByName('root', MANGA_ROOT_FOLDER_NAME, DRIVE_FOLDER_MIME)
+  if (existing) return existing
+  return createDriveFolder(MANGA_ROOT_FOLDER_NAME)
+}
+
+// Find a direct child folder of parentId by exact name, or create one if absent.
+// Returns the folder id and whether it was newly created. Callers that reuse a
+// per-manga folder across runs (e.g. re-running "Manga mới" after a failure, or
+// by mistake instead of "Thêm chapter vào manga có sẵn") check `created` to
+// decide whether to treat the folder as fresh or as a prior run's output to
+// merge into instead of duplicating.
+export async function findOrCreateChildFolder(parentId: string, name: string): Promise<{ id: string; created: boolean }> {
+  const existing = await findChildByName(parentId, name, DRIVE_FOLDER_MIME)
+  if (existing) return { id: existing, created: false }
+  return { id: await createDriveFolder(name, parentId), created: true }
+}
+
 // Create a folder and return its id. parentId omitted → created in Drive root.
-export async function createDriveFolder(name: string, parentId?: string): Promise<string> {
+// signal lets a per-chapter cancel abort this specific request without touching
+// other chapters' in-flight uploads (see AdminScrambleTab's per-chapter Cancel).
+export async function createDriveFolder(name: string, parentId?: string, signal?: AbortSignal): Promise<string> {
   const body: Record<string, unknown> = {
     name,
     mimeType: 'application/vnd.google-apps.folder',
   }
   if (parentId) body.parents = [parentId]
   const r = await driveFetch(
-    (token, signal) => fetch('https://www.googleapis.com/drive/v3/files?fields=id', {
+    (token, reqSignal) => fetch('https://www.googleapis.com/drive/v3/files?fields=id', {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal,
+      signal: reqSignal,
     }),
     'Tạo folder Drive thất bại',
+    DEFAULT_TIMEOUT_MS,
+    signal,
   )
   return (await r.json()).id
 }
 
 // Multipart upload of a blob into parentId. Returns the new file id.
-export async function uploadDriveFile(name: string, blob: Blob, parentId: string): Promise<string> {
+// signal: see createDriveFolder.
+export async function uploadDriveFile(name: string, blob: Blob, parentId: string, signal?: AbortSignal): Promise<string> {
   const metadata = { name, parents: [parentId] }
   const r = await driveFetch(
-    (token, signal) => {
+    (token, reqSignal) => {
       const form = new FormData()
       form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }))
       form.append('file', blob)
@@ -273,12 +314,13 @@ export async function uploadDriveFile(name: string, blob: Blob, parentId: string
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
           body: form,
-          signal,
+          signal: reqSignal,
         },
       )
     },
     'Upload ảnh lên Drive thất bại',
     UPLOAD_TIMEOUT_MS,
+    signal,
   )
   return (await r.json()).id
 }
@@ -286,7 +328,22 @@ export async function uploadDriveFile(name: string, blob: Blob, parentId: string
 // Grant the backend service account reader access on a file/folder so the
 // existing read-only /api/images proxy can serve the uploaded tiles. Folder
 // permissions cascade to children, so sharing the run's root folder is enough.
+// Idempotent: checks for an existing permission for serviceEmail first, since
+// this is called on every "Manga mới"/"Thêm chapter" run (so folders shared
+// under an older code path, or interrupted before sharing, get picked up
+// automatically) — without the check, Drive has no dedupe and would grow a
+// new permission entry for the same email on every single run.
 export async function shareWithServiceAccount(fileId: string, serviceEmail: string): Promise<void> {
+  const listRes = await driveFetch(
+    (token, signal) => fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}/permissions?fields=permissions(emailAddress,role)`,
+      { headers: { Authorization: `Bearer ${token}` }, signal },
+    ),
+    'Kiểm tra quyền chia sẻ folder trên Drive thất bại',
+  )
+  const existing = (await listRes.json()).permissions as { emailAddress?: string; role: string }[] | undefined
+  if (existing?.some(p => p.emailAddress === serviceEmail)) return
+
   await driveFetch(
     (token, signal) => fetch(
       `https://www.googleapis.com/drive/v3/files/${fileId}/permissions?sendNotificationEmail=false`,

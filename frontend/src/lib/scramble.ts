@@ -1,8 +1,7 @@
 // Core scramble/unscramble permutation logic.
 // Single source of truth shared by the reader (UnscrambleImage) and the admin
-// scramble tool (AdminScrambleTab), so both produce/consume the exact same
-// permutation. Mirrors the C# tool (scramble/MangaScramble/ScrambleAlgorithm.cs)
-// — FNV-1a seed + Mulberry32 PRNG + Fisher-Yates — for cross-platform parity.
+// scramble tool (AdminScrambleTab). The server derives each chapter key; this
+// module turns that key into a deterministic tile permutation.
 
 export function getSeedFromKey(key: string): number {
   let hash = 2166136261 >>> 0
@@ -34,20 +33,6 @@ export function generatePermutation(key: string, grid: number): number[] {
     ;[indices[i], indices[j]] = [indices[j], indices[i]]
   }
   return indices
-}
-
-// Derive the per-chapter key = HMAC-SHA256(masterKey, slug) as a lowercase hex
-// string. This hex string is then fed into getSeedFromKey → mulberry32 →
-// Fisher-Yates unchanged. Must stay byte-identical to the C# DeriveChapterKey
-// (scramble/MangaScramble/ScrambleAlgorithm.cs) and the backend derivation, or
-// the reader and the scramble tool will disagree on the permutation.
-export async function deriveChapterKey(masterKey: string, slug: string): Promise<string> {
-  const enc = new TextEncoder()
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw', enc.encode(masterKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  )
-  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(slug))
-  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
 export function generateInversePermutation(key: string, grid: number): number[] {

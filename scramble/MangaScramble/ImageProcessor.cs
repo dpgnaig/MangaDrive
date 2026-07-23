@@ -16,6 +16,13 @@ public class ChapterManifestEntry
     public string Slug { get; set; } = "";
     public int Grid { get; set; }
     public int FileCount { get; set; }
+    // Natural-sort position of this chapter among the input folder's chapters at
+    // the time it was (re-)recorded. Sync (MangaSyncService.cs) orders chapters by
+    // this instead of parsing a number out of Original — parsing broke on chapter
+    // names containing very long digit runs (OverflowException), and can't be
+    // trusted for ordering anyway once names get inconsistent. Nullable so
+    // manifests written before this field existed still parse.
+    public int? Order { get; set; }
 }
 
 /// <summary>
@@ -164,12 +171,11 @@ public static class ImageProcessor
         WriteIndented = true
     };
 
-    // Generate a unique chapter slug identical in shape to the web tool:
-    // "chapter-" + 6 random bytes as 12 lowercase hex chars.
+    // Generate 6 random bytes as a 12-character lowercase hex chapter slug.
     private static string NewSlug()
     {
         var bytes = RandomNumberGenerator.GetBytes(6);
-        return "chapter-" + Convert.ToHexString(bytes).ToLowerInvariant();
+        return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
     // Direct image files inside a folder (non-recursive), natural-sorted by name to
@@ -220,7 +226,9 @@ public static class ImageProcessor
             .ToArray();
         var chapterDirs = subDirs.Length > 0 ? subDirs : new[] { inputFolder };
 
-        // Pre-scan files per chapter for an accurate progress total.
+        // Pre-scan files per chapter for an accurate progress total. Index into this
+        // list is each chapter's natural-sort position (chapterDirs is already sorted
+        // by NaturalComparer above) — recorded as Order on its manifest entry below.
         var chapters = new List<(string name, string[] files)>();
         foreach (var dir in chapterDirs)
         {
@@ -246,6 +254,7 @@ public static class ImageProcessor
             }
         }
         var byOriginal = existingEntries.ToDictionary(e => e.Original, e => e);
+        var chapterOrder = chapters.Select((c, i) => (c.name, i)).ToDictionary(x => x.name, x => x.i);
 
         // Decide skip vs. process before touching any files, and size the progress
         // total to only the chapters that actually still need work.
@@ -295,10 +304,21 @@ public static class ImageProcessor
                 // Remove any prior (now-superseded) entry for this chapter before adding
                 // the fresh one — happens only when the old slug folder was missing/stale.
                 manifest.RemoveAll(e => e.Original == name);
-                manifest.Add(new ChapterManifestEntry { Original = name, Slug = slug, Grid = grid, FileCount = files.Length });
+                manifest.Add(new ChapterManifestEntry { Original = name, Slug = slug, Grid = grid, FileCount = files.Length, Order = chapterOrder[name] });
                 File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, ManifestJsonOptions));
             }
         }, ct);
+
+        // Backfill Order on entries that were skipped (already checkpointed from a
+        // prior run, possibly before this field existed) so every entry in the final
+        // manifest reflects the CURRENT input's natural-sort position — the set of
+        // chapters can change between runs (insertions/deletions), so a stale Order
+        // captured on a previous run could otherwise silently misorder sync.
+        foreach (var entry in manifest)
+        {
+            if (chapterOrder.TryGetValue(entry.Original, out var order)) entry.Order = order;
+        }
+        File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, ManifestJsonOptions));
 
         return processed;
     }

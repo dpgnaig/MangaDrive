@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
-import { Modal } from 'antd'
+import { Modal, message } from 'antd'
 import * as signalR from '@microsoft/signalr'
 import api from '../lib/api'
 import { imgUrl } from '../lib/img'
@@ -125,6 +125,9 @@ export default function MangaDetail() {
   const [importJson, setImportJson] = useState('')
   const [importLoading, setImportLoading] = useState(false)
   const [showMetadata, setShowMetadata] = useState(false)
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft] = useState('')
+  const [savingTitle, setSavingTitle] = useState(false)
   const [scrollTop, setScrollTop] = useState(0)
   const [replyTo, setReplyTo] = useState<Comment | null>(null)
   const { user } = useAuth()
@@ -153,6 +156,28 @@ export default function MangaDetail() {
   const toggleFav = async () => {
     const { data } = await api.post(`/favorites/${id}`)
     setIsFavorite(data.isFavorite)
+  }
+
+  const startEditTitle = () => {
+    setTitleDraft(manga!.title)
+    setEditingTitle(true)
+  }
+
+  const cancelEditTitle = () => setEditingTitle(false)
+
+  const saveTitle = async () => {
+    const next = titleDraft.trim()
+    if (!next || next === manga!.title) { setEditingTitle(false); return }
+    setSavingTitle(true)
+    try {
+      await api.patch(`/admin/mangas/${id}/title`, { title: next })
+      setManga(prev => prev ? { ...prev, title: next } : prev)
+      setEditingTitle(false)
+      message.success('Đã đổi tên manga')
+    } catch (err: any) {
+      message.error(err.response?.data?.message || 'Đổi tên thất bại')
+    }
+    setSavingTitle(false)
   }
 
   useEffect(() => {
@@ -255,7 +280,36 @@ export default function MangaDetail() {
 
           {/* Title + Author + Buttons */}
           <div style={{ flex: 1, minWidth: 0, paddingBottom: 4 }}>
-            <h1 style={{ fontSize: 28, fontWeight: 700, lineHeight: 1.2, marginBottom: 6 }}>{manga.title}</h1>
+            {editingTitle ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <input
+                  autoFocus
+                  value={titleDraft}
+                  onChange={e => setTitleDraft(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') saveTitle(); if (e.key === 'Escape') cancelEditTitle() }}
+                  disabled={savingTitle}
+                  style={{ fontSize: 22, fontWeight: 700, lineHeight: 1.2, flex: 1, minWidth: 0, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--accent)', background: 'var(--bg-elevated)', color: 'var(--text)', outline: 'none' }}
+                />
+                <button onClick={saveTitle} disabled={savingTitle} title="Lưu"
+                  style={{ width: 32, height: 32, borderRadius: 6, border: 'none', background: 'var(--accent)', color: '#fff', cursor: savingTitle ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, opacity: savingTitle ? 0.6 : 1 }}>
+                  <span className="ms" style={{ fontSize: 18 }}>check</span>
+                </button>
+                <button onClick={cancelEditTitle} disabled={savingTitle} title="Hủy"
+                  style={{ width: 32, height: 32, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', cursor: savingTitle ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <span className="ms" style={{ fontSize: 18 }}>close</span>
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <h1 style={{ fontSize: 28, fontWeight: 700, lineHeight: 1.2, margin: 0, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{manga.title}</h1>
+                {user?.role === 'Admin' && (
+                  <button onClick={startEditTitle} title="Đổi tên manga"
+                    style={{ width: 28, height: 28, borderRadius: 6, border: 'none', background: 'none', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <span className="ms" style={{ fontSize: 18 }}>edit</span>
+                  </button>
+                )}
+              </div>
+            )}
             <p style={{ fontSize: 14, color: 'var(--text-secondary)', marginBottom: 12 }}>{manga.author || 'Unknown'}</p>
 
             {/* Action buttons */}

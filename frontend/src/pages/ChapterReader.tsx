@@ -46,8 +46,10 @@ export default function ChapterReader() {
   const [reportReason, setReportReason] = useState('')
   const [reporting, setReporting] = useState(false)
   const [scramble, setScramble] = useState<ScrambleState>({ status: 'none' })
+  const [progress, setProgress] = useState(0)
 
   useEffect(() => {
+    setProgress(0)
     setScramble({ status: 'none' })
     api.get(`/chapters/${id}`).then(r => {
       setChapter(r.data)
@@ -70,13 +72,21 @@ export default function ChapterReader() {
   }, [id])
 
   useEffect(() => {
-    let t: number
-    const auto = () => { t = window.setTimeout(() => setShowUI(false), 3000) }
-    auto()
-    const reset = () => { setShowUI(true); clearTimeout(t); auto() }
-    window.addEventListener('scroll', reset)
-    return () => { window.removeEventListener('scroll', reset); clearTimeout(t) }
-  }, [])
+    let lastY = window.scrollY
+    const onScroll = () => {
+      const y = window.scrollY
+      const diff = y - lastY
+      const scrollable = document.documentElement.scrollHeight - window.innerHeight
+      const atEdge = y < 10 || (scrollable > 0 && scrollable - y < 5) // top or bottom of chapter
+      if (atEdge) { setShowUI(true) } else if (Math.abs(diff) >= 6) { setShowUI(diff < 0) } // up shows, down hides
+      lastY = y
+
+      setProgress(scrollable > 0 ? Math.min(1, Math.max(0, y / scrollable)) : 0)
+    }
+    onScroll()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [chapter?.id])
 
   if (!chapter) return <ChapterReaderSkeleton />
 
@@ -148,9 +158,12 @@ export default function ChapterReader() {
         )}
       </div>
 
-      {/* Bottom bar — reuses the shared BottomNavBar shell so Prev / List / Next
-          stay visually in sync with the system BottomNav. */}
+      {/* Bottom bar — floating transparent glass pill, reuses the shared
+          BottomNavBar shell so Prev / List / Next stay in sync with the app's
+          nav interactions while getting their own highlighted-icon look. */}
       <BottomNavBar
+        variant="glass"
+        progress={progress}
         onContainerClick={e => e.stopPropagation()}
         style={{
           zIndex: 50,
@@ -171,6 +184,7 @@ export default function ChapterReader() {
             key: 'list',
             icon: 'list',
             label: `${currentIdx + 1}/${chapters.length}`,
+            active: showChapterList,
             onClick: e => { e.stopPropagation(); setShowChapterList(true) },
           },
           {

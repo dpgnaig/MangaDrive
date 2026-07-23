@@ -26,9 +26,13 @@ export default function AdminRootFoldersTab({ showAddModal, onCloseAddModal }: {
   const [folderId, setFolderId] = useState('')
   const [newChapters, setNewChapters] = useState<Record<string, Record<string, number>>>({}) // rootId -> { mangaId: count }
   const scanResultsRef = useRef<Record<string, ScanResult>>({})
+  // Kept in sync with syncingMangas so the SignalR handler (registered once,
+  // closes over stale state otherwise) can check/clear the right manga ids.
+  const syncingMangasRef = useRef<Set<string>>(new Set())
 
   // Keep ref in sync with state for use in SignalR handler
   useEffect(() => { scanResultsRef.current = scanResults }, [scanResults])
+  useEffect(() => { syncingMangasRef.current = syncingMangas }, [syncingMangas])
 
   useEffect(() => { load() }, [])
 
@@ -57,9 +61,20 @@ export default function AdminRootFoldersTab({ showAddModal, onCloseAddModal }: {
         }
       }
 
-      if (p.status === 'Completed') {
-        // Reload to pick up any auto-link or chapter changes
-        setTimeout(() => load(), 1000)
+      if (p.status === 'Completed' || p.status === 'Failed') {
+        // A single-manga sync (syncManga) tracks its own spinner via
+        // syncingMangas, keyed by manga id — clear it as soon as the job that
+        // touched this manga actually finishes, instead of a fixed timeout
+        // that's decoupled from real progress (see syncManga below).
+        if (p.currentMangaId && syncingMangasRef.current.has(p.currentMangaId)) {
+          setSyncingMangas(prev => { const s = new Set(prev); s.delete(p.currentMangaId!); return s })
+        }
+        if (p.status === 'Failed') {
+          message.error(`Đồng bộ "${p.currentManga || p.rootName}" thất bại: ${p.message}`)
+        } else {
+          // Reload to pick up any auto-link or chapter changes
+          setTimeout(() => load(), 1000)
+        }
       }
     })
     return () => { conn.stop() }
@@ -119,8 +134,17 @@ export default function AdminRootFoldersTab({ showAddModal, onCloseAddModal }: {
   }
   const syncManga = async (id: string, title: string) => {
     setSyncingMangas(prev => new Set(prev).add(id))
-    try { await api.post(`/admin/mangas/${id}/sync`); message.success(`Đang sync "${title}"`) } catch { message.error('Sync thất bại') }
-    setTimeout(() => setSyncingMangas(prev => { const s = new Set(prev); s.delete(id); return s }), 5000)
+    try {
+      await api.post(`/admin/mangas/${id}/sync`)
+      message.success(`Đang sync "${title}"`)
+    } catch {
+      message.error('Sync thất bại')
+      setSyncingMangas(prev => { const s = new Set(prev); s.delete(id); return s })
+    }
+    // No timeout here — the SignalR handler above clears this manga's spinner
+    // (and reloads on success / toasts on failure) once the real job for it
+    // reports Completed/Failed via currentMangaId, so it can't clear early
+    // while the job is still running or hang forever if the job crashes.
   }
   const syncSingleFromScan = async (rootId: string, driveFileId: string, folderName: string) => {
     try {
