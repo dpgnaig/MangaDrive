@@ -37,7 +37,7 @@ public class MangasController : ControllerBase
 
         var primaryMangas = await query.Select(m => new {
             m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status,
-            m.Genres, m.CoverImageFileId, m.BannerImageFileId, m.UpdatedAt, m.ViewCount
+            m.Genres, m.CoverImageFileId, m.BannerImageFileId, m.UpdatedAt, m.ViewCount, m.IsNSFW
         }).ToListAsync();
 
         // Get all linked manga IDs
@@ -71,7 +71,7 @@ public class MangasController : ControllerBase
             var totalChapters = infos.Sum(i => i.Count);
             var latest = latestChapters.Where(lc => relatedIds.Contains(lc.MangaId)).OrderByDescending(lc => lc.MaxSort).FirstOrDefault();
             return new MangaDto(m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status,
-                m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters, latest?.LatestName, m.UpdatedAt, m.ViewCount, latest?.LatestChapterNumber);
+                m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters, latest?.LatestName, m.UpdatedAt, m.ViewCount, latest?.LatestChapterNumber, m.IsNSFW);
         }).ToList();
 
         return Ok(mangas);
@@ -111,7 +111,7 @@ public class MangasController : ControllerBase
         var pageItems = await query
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
-            .Select(m => new { m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status, m.Genres, m.CoverImageFileId, m.BannerImageFileId, m.UpdatedAt, m.ViewCount })
+            .Select(m => new { m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status, m.Genres, m.CoverImageFileId, m.BannerImageFileId, m.UpdatedAt, m.ViewCount, m.IsNSFW })
             .ToListAsync();
 
         // Resolve linked chapter counts
@@ -135,7 +135,7 @@ public class MangasController : ControllerBase
             var totalChapters = infos.Sum(i => i.Count);
             var latest = infos.OrderByDescending(i => i.MaxSort).FirstOrDefault();
             return new MangaDto(m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status,
-                m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters, latest?.LatestName, m.UpdatedAt, m.ViewCount, latest?.LatestChapterNumber);
+                m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters, latest?.LatestName, m.UpdatedAt, m.ViewCount, latest?.LatestChapterNumber, m.IsNSFW);
         }).ToList();
 
         return Ok(PaginatedResult<MangaDto>.Create(items, total, page, pageSize));
@@ -174,7 +174,7 @@ public class MangasController : ControllerBase
         return Ok(new MangaDto(m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status,
             m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters,
             latestChapter?.Name,
-            m.UpdatedAt, m.ViewCount, latestChapter?.ChapterNumber));
+            m.UpdatedAt, m.ViewCount, latestChapter?.ChapterNumber, m.IsNSFW));
     }
 
     [HttpGet("{id:guid}/chapters")]
@@ -192,7 +192,7 @@ public class MangasController : ControllerBase
         var chapters = await _db.Chapters
             .Where(c => allMangaIds.Contains(c.MangaId))
             .OrderBy(c => c.SortOrder)
-            .Select(c => new ChapterDto(c.Id, c.Name, c.SortOrder, c.Images.Count, c.ChapterNumber, c.ChapterName))
+            .Select(c => new ChapterDto(c.Id, c.Name, c.SortOrder, c.Images.Count, c.ChapterNumber, c.ChapterName, c.Slug))
             .ToListAsync();
 
         return Ok(chapters);

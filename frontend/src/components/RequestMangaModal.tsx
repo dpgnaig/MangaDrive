@@ -24,7 +24,9 @@ export default function RequestMangaModal({ open, onClose, onSubmit }: {
     if (!canSubmit) return
     const t = title.trim()
     const u = url.trim()
-    const content = u ? `${t}\nLink tham khảo: ${u}` : t
+    // No "Link tham khảo:" label here — RequestChatThread renders the URL line
+    // as a highlighted link chip with a link icon instead of a text prefix.
+    const content = u ? `${t}\n${u}` : t
     setSubmitting(true)
     try {
       await onSubmit(content)

@@ -15,6 +15,7 @@ interface Candidate {
   coverUrl: string | null
   bannerUrl: string | null
   detailUrl: string | null
+  isNSFW: boolean | null
 }
 
 const SOURCES = ['anilist', 'mangadex'] as const
@@ -29,11 +30,12 @@ interface FieldFlags {
   genres: boolean
   cover: boolean
   banner: boolean
+  isNSFW: boolean
 }
 
 const DEFAULT_FLAGS: FieldFlags = {
   title: true, otherTitles: true, description: true, author: true,
-  status: true, genres: true, cover: true, banner: true,
+  status: true, genres: true, cover: true, banner: true, isNSFW: true,
 }
 
 /**
@@ -94,6 +96,7 @@ export default function MetadataPickerModal({ open, onClose, mangaId, initialQue
         genres: selected.genres,
         coverUrl: selected.coverUrl,
         bannerUrl: selected.bannerUrl,
+        isNSFW: selected.isNSFW,
         applyTitle: flags.title,
         applyOtherTitles: flags.otherTitles,
         applyDescription: flags.description,
@@ -102,6 +105,7 @@ export default function MetadataPickerModal({ open, onClose, mangaId, initialQue
         applyGenres: flags.genres,
         applyCover: flags.cover,
         applyBanner: flags.banner,
+        applyIsNSFW: flags.isNSFW,
       })
       message.success('Đã cập nhật metadata')
       onApplied()
@@ -161,6 +165,9 @@ export default function MetadataPickerModal({ open, onClose, mangaId, initialQue
                 <div style={{ position: 'relative', width: '100%', aspectRatio: '2/3', borderRadius: 6, overflow: 'hidden', background: 'var(--bg-hover)', marginBottom: 6 }}>
                   {c.coverUrl && <img src={c.coverUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
                   <span style={{ position: 'absolute', top: 4, left: 4, fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4, background: 'rgba(0,0,0,0.7)', color: '#fff' }}>{c.source}</span>
+                  {c.isNSFW === true && (
+                    <span style={{ position: 'absolute', top: 4, right: 4, fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4, background: 'rgba(229,72,77,0.9)', color: '#fff' }}>NSFW</span>
+                  )}
                 </div>
                 <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.title}</p>
               </button>
@@ -180,6 +187,9 @@ export default function MetadataPickerModal({ open, onClose, mangaId, initialQue
               <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>{selected.title}</h3>
               {selected.author && <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 4 }}>{selected.author}</p>}
               {selected.status && <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase' }}>{selected.status}</p>}
+              {selected.isNSFW === true && (
+                <span style={{ display: 'inline-block', fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 4, background: 'var(--red, #e5484d)', color: '#fff', marginBottom: 6 }}>NSFW</span>
+              )}
               {selected.genres.length > 0 && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
                   {selected.genres.map(g => (
@@ -212,10 +222,12 @@ export default function MetadataPickerModal({ open, onClose, mangaId, initialQue
               ['genres', 'Thể loại'],
               ['cover', 'Ảnh bìa'],
               ['banner', 'Banner'],
+              ['isNSFW', 'NSFW'],
             ] as [keyof FieldFlags, string][])
               .filter(([k]) => {
                 if (k === 'cover') return !!selected.coverUrl
                 if (k === 'banner') return !!selected.bannerUrl
+                if (k === 'isNSFW') return selected.isNSFW !== null
                 return true
               })
               .map(([k, label]) => (

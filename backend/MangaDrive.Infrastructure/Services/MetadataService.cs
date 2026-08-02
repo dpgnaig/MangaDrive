@@ -60,6 +60,7 @@ public class MetadataService : IMetadataService
                       status
                       genres
                       synonyms
+                      isAdult
                       coverImage { extraLarge large }
                       bannerImage
                       staff(perPage: 8) { edges { role node { name { full } } } }
@@ -128,7 +129,8 @@ public class MetadataService : IMetadataService
                     Genres: genres,
                     CoverUrl: string.IsNullOrEmpty(cover) ? null : cover,
                     BannerUrl: TryStr(media, "bannerImage"),
-                    DetailUrl: $"https://anilist.co/manga/{id}"
+                    DetailUrl: $"https://anilist.co/manga/{id}",
+                    IsNSFW: TryBool(media, "isAdult")
                 ));
             }
         }
@@ -164,6 +166,15 @@ public class MetadataService : IMetadataService
         "HIATUS" => "hiatus",
         "CANCELLED" => "cancelled",
         _ => raw.ToLowerInvariant()
+    };
+
+    // MangaDex's contentRating is a tri-state-ish enum, not a plain bool — map it onto
+    // the same null=unknown/true=NSFW/false=safe semantics as AniList's isAdult.
+    private static bool? NormalizeContentRating(string? raw) => raw?.ToLowerInvariant() switch
+    {
+        "safe" => false,
+        "suggestive" or "erotica" or "pornographic" => true,
+        _ => null
     };
 
     // ── MangaDex ─────────────────────────────────────────────────────────────
@@ -262,7 +273,8 @@ public class MetadataService : IMetadataService
                     Genres: genres,
                     CoverUrl: coverUrl,
                     BannerUrl: null,
-                    DetailUrl: $"https://mangadex.org/title/{id}"
+                    DetailUrl: $"https://mangadex.org/title/{id}",
+                    IsNSFW: NormalizeContentRating(TryStr(attrs, "contentRating"))
                 ));
             }
         }
@@ -290,6 +302,10 @@ public class MetadataService : IMetadataService
 
     private static string? TryStr(JsonElement el, string prop)
         => el.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    private static bool? TryBool(JsonElement el, string prop)
+        => el.TryGetProperty(prop, out var v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False)
+            ? v.GetBoolean() : null;
 
     private static string? FirstObjString(JsonElement obj)
     {

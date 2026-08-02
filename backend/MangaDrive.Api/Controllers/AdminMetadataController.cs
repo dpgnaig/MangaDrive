@@ -68,6 +68,11 @@ public class AdminMetadataController : ControllerBase
         if (dto.ApplyBanner && !string.IsNullOrWhiteSpace(dto.BannerUrl))
             manga.BannerImageFileId = dto.BannerUrl.Trim();
 
+        // Unlike the text fields above, false/null are both meaningful values here
+        // (confirmed-safe vs unknown) — gate purely on the toggle, not on truthiness.
+        if (dto.ApplyIsNSFW)
+            manga.IsNSFW = dto.IsNSFW;
+
         manga.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync();
 
@@ -86,6 +91,7 @@ public record ApplyMetadataDto(
     List<string>? Genres,
     string? CoverUrl,
     string? BannerUrl,
+    bool? IsNSFW,
     bool ApplyTitle = true,
     bool ApplyOtherTitles = true,
     bool ApplyDescription = true,
@@ -93,5 +99,6 @@ public record ApplyMetadataDto(
     bool ApplyStatus = true,
     bool ApplyGenres = true,
     bool ApplyCover = true,
-    bool ApplyBanner = true
+    bool ApplyBanner = true,
+    bool ApplyIsNSFW = true
 );

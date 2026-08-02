@@ -22,7 +22,7 @@ function timeAgo(dateStr: string) {
   return new Date(dateStr).toLocaleDateString()
 }
 
-interface Manga { id: string; title: string; author: string; coverImageFileId: string; bannerImageFileId: string; chapterCount: number; latestChapter: string | null; latestChapterNumber: string | null; updatedAt: string; genres: string; status: string; viewCount: number }
+interface Manga { id: string; title: string; author: string; coverImageFileId: string; bannerImageFileId: string; chapterCount: number; latestChapter: string | null; latestChapterNumber: string | null; updatedAt: string; genres: string; status: string; viewCount: number; isNSFW: boolean | null }
 interface ContinueItem { id: string; mangaId: string; title: string; coverImageFileId: string; chapterId: string; chapterName: string }
 
 export default function MangaList() {
@@ -243,6 +243,9 @@ export default function MangaList() {
                       {m.coverImageFileId
                         ? <img src={imgUrl(m.coverImageFileId)} alt={m.title} style={{ width: '100%', height: '100%', objectFit: 'cover' }} loading="lazy" />
                         : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span className="ms" style={{ fontSize: 40, color: 'var(--text-muted)' }}>auto_stories</span></div>}
+                      {m.isNSFW === true && (
+                        <span style={{ position: 'absolute', top: 6, right: 6, fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4, background: 'var(--red, #e5484d)', color: '#fff' }}>NSFW</span>
+                      )}
                       <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '32px 10px 10px', background: 'linear-gradient(0deg, rgba(0,0,0,0.9) 0%, transparent 100%)' }}>
                         <p style={{ fontSize: 14, fontWeight: 700, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textShadow: '0 1px 3px rgba(0,0,0,0.8)', marginBottom: 4 }}>{m.title}</p>
                         {(m.latestChapterNumber || m.latestChapter) && <p style={{ fontSize: 11, color: 'var(--accent)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.latestChapterNumber ? `Ch. ${m.latestChapterNumber}` : m.latestChapter}</p>}
@@ -260,6 +263,9 @@ export default function MangaList() {
                       {m.coverImageFileId
                         ? <img src={imgUrl(m.coverImageFileId)} alt={m.title} style={{ width: '100%', height: '100%', objectFit: 'cover' }} loading="lazy" />
                         : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span className="ms" style={{ fontSize: 40, color: 'var(--text-muted)' }}>auto_stories</span></div>}
+                      {m.isNSFW === true && (
+                        <span style={{ position: 'absolute', top: 6, right: 6, fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4, background: 'var(--red, #e5484d)', color: '#fff' }}>NSFW</span>
+                      )}
                       <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '32px 10px 10px', background: 'linear-gradient(0deg, rgba(0,0,0,0.9) 0%, transparent 100%)' }}>
                         <p style={{ fontSize: 14, fontWeight: 700, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textShadow: '0 1px 3px rgba(0,0,0,0.8)', marginBottom: 4 }}>{m.title}</p>
                         {(m.latestChapterNumber || m.latestChapter) && <p style={{ fontSize: 11, color: 'var(--accent)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.latestChapterNumber ? `Ch. ${m.latestChapterNumber}` : m.latestChapter}</p>}
@@ -333,6 +339,9 @@ export default function MangaList() {
                               {m.coverImageFileId
                                 ? <img src={imgUrl(m.coverImageFileId)} alt={m.title} style={{ width: '100%', height: '100%', objectFit: 'cover' }} loading="lazy" />
                                 : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span className="ms" style={{ fontSize: 40, color: 'var(--text-muted)' }}>auto_stories</span></div>}
+                              {m.isNSFW === true && (
+                                <span style={{ position: 'absolute', top: 6, right: 6, fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4, background: 'var(--red, #e5484d)', color: '#fff' }}>NSFW</span>
+                              )}
                               <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '32px 10px 10px', background: 'linear-gradient(0deg, rgba(0,0,0,0.9) 0%, transparent 100%)' }}>
                                 <p style={{ fontSize: 13, fontWeight: 700, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textShadow: '0 1px 3px rgba(0,0,0,0.8)', marginBottom: 3 }}>{m.title}</p>
                                 {(m.latestChapterNumber || m.latestChapter) && <p style={{ fontSize: 11, color: 'var(--accent)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.latestChapterNumber ? `Ch. ${m.latestChapterNumber}` : m.latestChapter}</p>}
@@ -350,6 +359,9 @@ export default function MangaList() {
                               {m.coverImageFileId
                                 ? <img src={imgUrl(m.coverImageFileId)} alt={m.title} style={{ width: '100%', height: '100%', objectFit: 'cover' }} loading="lazy" />
                                 : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span className="ms" style={{ fontSize: 40, color: 'var(--text-muted)' }}>auto_stories</span></div>}
+                              {m.isNSFW === true && (
+                                <span style={{ position: 'absolute', top: 6, right: 6, fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4, background: 'var(--red, #e5484d)', color: '#fff' }}>NSFW</span>
+                              )}
                               <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '32px 10px 10px', background: 'linear-gradient(0deg, rgba(0,0,0,0.9) 0%, transparent 100%)' }}>
                                 <p style={{ fontSize: 13, fontWeight: 700, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textShadow: '0 1px 3px rgba(0,0,0,0.8)', marginBottom: 3 }}>{m.title}</p>
                                 {(m.latestChapterNumber || m.latestChapter) && <p style={{ fontSize: 11, color: 'var(--accent)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.latestChapterNumber ? `Ch. ${m.latestChapterNumber}` : m.latestChapter}</p>}

@@ -183,7 +183,29 @@ public class AdminRootFoldersController : ControllerBase
                     .Select(c => c.DriveFileId)
                     .ToListAsync();
                 var existingSet = existingDriveIds.ToHashSet();
-                var newChapters = driveFolders.Where(f => !existingSet.Contains(f.Id)).Select(f => f.Name).ToList();
+                var unmatched = driveFolders.Where(f => !existingSet.Contains(f.Id)).ToList();
+                if (unmatched.Count == 0) continue;
+
+                // A folder named like a scramble slug (chapter-xxxxxxxxxxxx) with no
+                // matching Chapter row is usually not a "new" chapter waiting to be
+                // synced — MangaSyncService intentionally skips slug folders that have
+                // no manifest.json entry yet (checkpoint upload still in progress, or
+                // an aborted upload left an orphan folder behind). Without this same
+                // check here, such an orphan gets flagged as "new" forever, since sync
+                // will keep skipping it every single run. Only fetch manifest.json when
+                // there's actually an unmatched slug-shaped folder to disambiguate.
+                HashSet<string>? manifestSlugs = null;
+                var newChapters = new List<string>();
+                foreach (var f in unmatched)
+                {
+                    if (ScrambleManifestUtil.SlugPattern.IsMatch(f.Name))
+                    {
+                        manifestSlugs ??= await ScrambleManifestUtil.ReadManifestSlugsAsync(
+                            _drive, await _drive.ListFilesAsync(manga.DriveFileId));
+                        if (!manifestSlugs.Contains(f.Name)) continue; // orphan, not new
+                    }
+                    newChapters.Add(f.Name);
+                }
 
                 if (newChapters.Count > 0)
                 {

@@ -15,10 +15,6 @@ public class MangaSyncService : IMangaSyncService
     private readonly ISyncNotifier _notifier;
     private readonly ILogger<MangaSyncService> _logger;
 
-    // Matches current 12-hex slugs and legacy `chapter-` prefixed slugs. Used to
-    // detect a checkpoint-upload race before manifest.json contains the folder entry.
-    private static readonly Regex ScrambleSlugPattern = new(@"^(?:chapter-)?[0-9a-f]{12}$", RegexOptions.Compiled);
-
     public MangaSyncService(AppDbContext db, IGoogleDriveService drive,
         ISyncNotifier notifier, ILogger<MangaSyncService> logger)
     {
@@ -222,7 +218,7 @@ public class MangaSyncService : IMangaSyncService
             // for now instead of falling back to the raw slug as a display name
             // (which regexes into a meaningless "chapter number"); the next sync
             // pass will see the completed manifest and pick it up correctly.
-            if (manifestEntry == null && ScrambleSlugPattern.IsMatch(cf.Name))
+            if (manifestEntry == null && ScrambleManifestUtil.SlugPattern.IsMatch(cf.Name))
             {
                 job.SyncedChapter++;
                 await SaveAndNotify(job, rootName);
@@ -254,32 +250,27 @@ public class MangaSyncService : IMangaSyncService
             }
             else
             {
-                // This chapter was previously created by the fallback path above
-                // (manifest missed it at the time, so it was named/numbered from
-                // the raw slug) and the manifest now has a real entry for it —
-                // self-heal the name/number/order using the now-complete manifest.
-                // A chapter with no manifest (never scrambled) always has
-                // manifestEntry == null, so this never touches non-scrambled chapters.
-                var wasCreatedFromFallback = chapter.Slug == null && manifestEntry != null;
-                if (wasCreatedFromFallback)
+                // manifest.json is the durable source of truth for a scrambled chapter's
+                // name/number/order — resync Name/ChapterNumber/ChapterName/SortOrder/
+                // ManifestOrder from it on every sync (not just once), so a stale override
+                // left by e.g. the admin "Import chapter" paste-JSON flow self-heals on the
+                // next sync instead of sticking around indefinitely. Chapters with no
+                // manifest entry (never scrambled) are untouched here — Import chapter is
+                // their only source of a clean name, so only backfill when still unset.
+                if (manifestEntry != null)
                 {
                     chapter.Name = displayName;
+                    chapter.ChapterNumber = ExtractChapterNumber(displayName);
+                    chapter.ChapterName = ExtractChapterName(displayName);
                     chapter.SortOrder = i;
+                    chapter.Slug ??= manifestEntry.Slug;
+                    chapter.Grid ??= manifestEntry.Grid;
+                    chapter.ManifestOrder = manifestEntry.Order;
                 }
-
-                // Backfill: if existing chapter has no ChapterNumber, extract from Name
-                if (chapter.ChapterNumber == null || wasCreatedFromFallback)
+                else if (chapter.ChapterNumber == null)
                 {
                     chapter.ChapterNumber = ExtractChapterNumber(chapter.Name);
                     chapter.ChapterName = ExtractChapterName(chapter.Name);
-                }
-                // Backfill scramble slug/grid/order on re-sync for chapters synced
-                // before Phase 2, or re-uploaded with the manifest present.
-                if (manifestEntry != null)
-                {
-                    if (chapter.Slug == null) chapter.Slug = manifestEntry.Slug;
-                    if (chapter.Grid == null) chapter.Grid = manifestEntry.Grid;
-                    if (chapter.ManifestOrder == null) chapter.ManifestOrder = manifestEntry.Order;
                 }
             }
 
@@ -584,10 +575,14 @@ public class MangaSyncService : IMangaSyncService
     // A name/number too long to fit Int32 (e.g. a stray long digit run in a folder
     // name) used to throw OverflowException here and crash the whole sync job.
     // TryParse + fallback to MaxValue means such a chapter just sorts last instead.
+    // A name with NO digits at all (e.g. "Chương Oneshot - Joker") also falls back
+    // to MaxValue rather than 0 — 0 used to make such chapters sort as if they were
+    // chapter 0, which (combined with the reader's newest-first display) made them
+    // appear to vanish at the bottom of long chapter lists instead of showing up.
     private static int ExtractNumber(string name)
     {
         var match = Regex.Match(name, @"\d+");
-        if (!match.Success) return 0;
+        if (!match.Success) return int.MaxValue;
         return int.TryParse(match.Value, out var n) ? n : int.MaxValue;
     }
 
