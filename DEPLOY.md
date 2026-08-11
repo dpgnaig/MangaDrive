@@ -100,9 +100,9 @@ DOMAIN=mangadrive.xyz
 JWT_SECRET=<chuỗi-random-ít-nhất-32-ký-tự>
 GOOGLE_CLIENT_ID=<your-client-id>.apps.googleusercontent.com
 GOOGLE_CLIENT_SECRET=<your-client-secret>
+GOOGLE_API_KEY=<your-browser-restricted-picker-api-key>
 ADMIN_EMAIL=<your-email@gmail.com>
-SCRAMBLE_KEY=<your-scramble-secret-key>
-SCRAMBLE_GRID=6
+SCRAMBLE_MASTER_KEY=<your-scramble-master-key>
 SCRAMBLE_ENABLED=true
 EOF
 ```

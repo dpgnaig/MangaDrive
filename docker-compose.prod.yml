@@ -34,6 +34,7 @@ services:
       - Cors__AllowedOrigins__0=https://${DOMAIN}
       - AdminEmails__0=${ADMIN_EMAIL}
       - Scramble__Enabled=${SCRAMBLE_ENABLED:-true}
+      - Scramble__MasterKey=${SCRAMBLE_MASTER_KEY}
     volumes:
       - db-data:/app/data
       - ./secrets:/app/secrets:ro
@@ -47,8 +48,7 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
-        VITE_SCRAMBLE_KEY: ${SCRAMBLE_KEY}
-        VITE_SCRAMBLE_GRID: ${SCRAMBLE_GRID:-6}
+        VITE_GOOGLE_API_KEY: ${GOOGLE_API_KEY}
     expose:
       - "80"
     depends_on:

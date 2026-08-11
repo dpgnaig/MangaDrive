@@ -14,6 +14,18 @@ function fmtTime(d: string) {
   return new Date(d).toLocaleString('vi', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })
 }
 
+// Request content is "<title>\n<url>" (RequestMangaModal), but older messages
+// may still carry the legacy "<title>\nLink tham khảo: <url>" format — strip
+// that prefix too so both render the same way.
+function parseRequestContent(content: string) {
+  const nl = content.indexOf('\n')
+  if (nl < 0) return { title: content, url: null as string | null }
+  const title = content.slice(0, nl)
+  const rest = content.slice(nl + 1)
+  const match = rest.match(/https?:\/\/\S+/)
+  return { title, url: match ? match[0] : null }
+}
+
 interface Props {
   messages: ReqMessage[]
   currentUserId: string
@@ -120,6 +132,7 @@ export default function RequestChatThread({ messages, currentUserId, amAdmin, on
           const mine = m.senderId === currentUserId
           const isRequest = m.type === 'Request'
           const sm = isRequest && m.status ? statusMeta(m.status) : null
+          const parsed = isRequest ? parseRequestContent(m.content) : null
           // "Seen" is shown only on my newest message, once the counterpart's
           // read cursor has advanced past it.
           const isMyLast = mine && idx === messages.length - 1
@@ -134,16 +147,30 @@ export default function RequestChatThread({ messages, currentUserId, amAdmin, on
                   background: 'var(--bg-elevated)', border: '1px solid var(--accent)',
                   borderBottomRightRadius: mine ? 4 : 14, borderBottomLeftRadius: mine ? 14 : 4,
                 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, color: 'var(--accent)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, color: 'var(--accent)' }}>
                     <span className="ms" style={{ fontSize: 16 }}>library_add</span>
                     <span style={{ fontSize: 12, fontWeight: 600 }}>Yêu cầu manga</span>
                   </div>
-                  <div style={{ fontSize: 14, lineHeight: 1.45, whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--text)' }}>{m.content}</div>
-                  {sm && (
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, fontWeight: 500, padding: '2px 9px', borderRadius: 10, background: sm.bg, color: sm.color, marginTop: 8 }}>
-                      <span className="ms" style={{ fontSize: 13 }}>{sm.icon}</span>{sm.label}
-                    </span>
-                  )}
+                  <span style={{ display: 'inline-flex', maxWidth: '100%', fontSize: 14, fontWeight: 600, lineHeight: 1.4, color: 'var(--text)', background: 'var(--accent-subtle)', borderRadius: 14, padding: '5px 12px', wordBreak: 'break-word' }}>
+                    {parsed!.title}
+                  </span>
+                  {/* Fixed second row: link pinned left, status pinned right — so
+                      every request card has the same two-row shape regardless of
+                      whether a url or status is present. */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginTop: 6, minHeight: 20 }}>
+                    {parsed!.url ? (
+                      <a href={parsed!.url} target="_blank" rel="noopener noreferrer"
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, fontWeight: 500, color: 'var(--accent)', textDecoration: 'none' }}>
+                        <span className="ms" style={{ fontSize: 14 }}>link</span>
+                        Link tham khảo
+                      </a>
+                    ) : <span />}
+                    {sm && (
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, fontWeight: 500, padding: '2px 9px', borderRadius: 10, background: sm.bg, color: sm.color }}>
+                        <span className="ms" style={{ fontSize: 13 }}>{sm.icon}</span>{sm.label}
+                      </span>
+                    )}
+                  </div>
                 </div>
               ) : (
                 /* Text bubble */

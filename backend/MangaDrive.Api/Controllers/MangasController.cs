@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using MangaDrive.Api.Filters;
+using MangaDrive.Api.Security;
 using MangaDrive.Core.DTOs;
 using MangaDrive.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
@@ -36,7 +37,7 @@ public class MangasController : ControllerBase
 
         var primaryMangas = await query.Select(m => new {
             m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status,
-            m.Genres, m.CoverImageFileId, m.BannerImageFileId, m.UpdatedAt, m.ViewCount
+            m.Genres, m.CoverImageFileId, m.BannerImageFileId, m.UpdatedAt, m.ViewCount, m.IsNSFW
         }).ToListAsync();
 
         // Get all linked manga IDs
@@ -70,7 +71,7 @@ public class MangasController : ControllerBase
             var totalChapters = infos.Sum(i => i.Count);
             var latest = latestChapters.Where(lc => relatedIds.Contains(lc.MangaId)).OrderByDescending(lc => lc.MaxSort).FirstOrDefault();
             return new MangaDto(m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status,
-                m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters, latest?.LatestName, m.UpdatedAt, m.ViewCount, latest?.LatestChapterNumber);
+                m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters, latest?.LatestName, m.UpdatedAt, m.ViewCount, latest?.LatestChapterNumber, m.IsNSFW);
         }).ToList();
 
         return Ok(mangas);
@@ -110,7 +111,7 @@ public class MangasController : ControllerBase
         var pageItems = await query
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
-            .Select(m => new { m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status, m.Genres, m.CoverImageFileId, m.BannerImageFileId, m.UpdatedAt, m.ViewCount })
+            .Select(m => new { m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status, m.Genres, m.CoverImageFileId, m.BannerImageFileId, m.UpdatedAt, m.ViewCount, m.IsNSFW })
             .ToListAsync();
 
         // Resolve linked chapter counts
@@ -134,7 +135,7 @@ public class MangasController : ControllerBase
             var totalChapters = infos.Sum(i => i.Count);
             var latest = infos.OrderByDescending(i => i.MaxSort).FirstOrDefault();
             return new MangaDto(m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status,
-                m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters, latest?.LatestName, m.UpdatedAt, m.ViewCount, latest?.LatestChapterNumber);
+                m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters, latest?.LatestName, m.UpdatedAt, m.ViewCount, latest?.LatestChapterNumber, m.IsNSFW);
         }).ToList();
 
         return Ok(PaginatedResult<MangaDto>.Create(items, total, page, pageSize));
@@ -173,7 +174,7 @@ public class MangasController : ControllerBase
         return Ok(new MangaDto(m.Id, m.Title, m.OtherTitles, m.Description, m.Author, m.Status,
             m.Genres, m.CoverImageFileId, m.BannerImageFileId, totalChapters,
             latestChapter?.Name,
-            m.UpdatedAt, m.ViewCount, latestChapter?.ChapterNumber));
+            m.UpdatedAt, m.ViewCount, latestChapter?.ChapterNumber, m.IsNSFW));
     }
 
     [HttpGet("{id:guid}/chapters")]
@@ -191,7 +192,7 @@ public class MangasController : ControllerBase
         var chapters = await _db.Chapters
             .Where(c => allMangaIds.Contains(c.MangaId))
             .OrderBy(c => c.SortOrder)
-            .Select(c => new ChapterDto(c.Id, c.Name, c.SortOrder, c.Images.Count, c.ChapterNumber, c.ChapterName))
+            .Select(c => new ChapterDto(c.Id, c.Name, c.SortOrder, c.Images.Count, c.ChapterNumber, c.ChapterName, c.Slug))
             .ToListAsync();
 
         return Ok(chapters);
@@ -226,6 +227,38 @@ public class ChaptersController : ControllerBase
         var isScrambled = _config.GetValue<bool>("Scramble:Enabled");
 
         return Ok(new ChapterDetailDto(chapter.Id, mangaId, chapter.Name, chapter.SortOrder, images, isScrambled));
+    }
+
+    /// <summary>
+    /// Session-gated per-chapter scramble key. Returns the derived key
+    /// HMAC-SHA256(masterKey, slug) — never the master key itself — plus the grid,
+    /// for the specific chapter the authorized user is reading. Rate-limited to
+    /// throttle bulk key enumeration.
+    /// </summary>
+    [HttpGet("{id:guid}/scramble-key")]
+    [Microsoft.AspNetCore.RateLimiting.EnableRateLimiting("scramble-key")]
+    public async Task<IActionResult> ScrambleKey(Guid id)
+    {
+        if (!_config.GetValue<bool>("Scramble:Enabled")) return NotFound();
+
+        var chapter = await _db.Chapters.FirstOrDefaultAsync(c => c.Id == id);
+        if (chapter == null) return NotFound();
+
+        // Scrambled chapter with no slug = synced before Phase 2 / manifest missing.
+        // Tell the reader clearly so it can show "chưa sẵn sàng, cần re-sync".
+        if (string.IsNullOrEmpty(chapter.Slug) || chapter.Grid == null)
+            return Conflict(new { code = "SLUG_MISSING", message = "Chương chưa sẵn sàng để giải mã (cần re-sync)." });
+
+        var masterKey = _config["Scramble:MasterKey"];
+        if (string.IsNullOrEmpty(masterKey))
+        {
+            // Misconfiguration: enabled but no server key. Don't leak details.
+            return StatusCode(500, new { code = "SERVER_KEY_MISSING", message = "Máy chủ chưa cấu hình khóa giải mã." });
+        }
+
+        Response.Headers.CacheControl = "no-store";
+        var key = ChapterKeyDeriver.Derive(masterKey, chapter.Slug);
+        return Ok(new { key, grid = chapter.Grid });
     }
 
     /// <summary>Reader reports a problem with a chapter; notifies every admin.</summary>

@@ -40,9 +40,9 @@ Sửa các giá trị:
 | `JWT_SECRET` | Chuỗi bí mật JWT, ít nhất 32 ký tự |
 | `GOOGLE_CLIENT_ID` | OAuth 2.0 Client ID |
 | `GOOGLE_CLIENT_SECRET` | OAuth 2.0 Client Secret |
+| `GOOGLE_API_KEY` | Browser-restricted API key cho Google Picker |
 | `ADMIN_EMAIL` | Email tài khoản admin đầu tiên |
-| `SCRAMBLE_KEY` | Key dùng để scramble/unscramble ảnh |
-| `SCRAMBLE_GRID` | Grid size (mặc định 6) |
+| `SCRAMBLE_MASTER_KEY` | Master key server-side để derive key theo chapter |
 
 ### 2. Đặt Service Account Key
 
@@ -95,8 +95,8 @@ Sửa `.env`:
 | `GOOGLE_CLIENT_ID` | OAuth Client ID |
 | `GOOGLE_CLIENT_SECRET` | OAuth Client Secret |
 | `ADMIN_EMAIL` | Email admin |
-| `SCRAMBLE_KEY` | Key scramble (giống với WPF tool) |
-| `SCRAMBLE_GRID` | Grid size (giống với WPF tool) |
+| `GOOGLE_API_KEY` | API key (browser-restricted) cho Google Picker — dùng khi thêm chapter vào manga có sẵn |
+| `SCRAMBLE_MASTER_KEY` | Master key scramble (server-side). Backend derive khóa per-chapter = HMAC(masterKey, slug), không bao giờ gửi masterKey ra client |
 
 ### 2. Service Account Key
 
@@ -168,4 +168,4 @@ docker compose [-f docker-compose.prod.yml] cp backend:/app/data/mangadrive.db .
 | Google login lỗi | Kiểm tra redirect URI trong Google Cloud Console |
 | SSL lỗi (local) | Bình thường nếu dùng proxy/VPN công ty, backend đã bypass |
 | Caddy không lấy cert | Kiểm tra domain đã trỏ A record về IP VPS chưa |
-| Ảnh scramble không hiển thị | Kiểm tra `SCRAMBLE_KEY` + `SCRAMBLE_GRID` khớp với WPF tool |
+| Ảnh scramble không hiển thị | Kiểm tra `SCRAMBLE_MASTER_KEY` trên backend khớp master key dùng khi re-upload; kiểm tra chapter đã sync `Slug` + `Grid` từ manifest.json |

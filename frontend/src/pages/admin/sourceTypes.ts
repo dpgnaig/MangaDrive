@@ -5,7 +5,7 @@ export interface MangaChild { id: string; title: string; isHidden: boolean; link
 
 export interface SyncProgress {
   syncJobId: string; rootFolderId: string; rootName: string; status: string
-  currentManga: string; currentChapter: string
+  currentManga: string; currentMangaId: string | null; currentChapter: string
   totalManga: number; syncedManga: number
   totalChapter: number; syncedChapter: number
   totalImage: number; syncedImage: number

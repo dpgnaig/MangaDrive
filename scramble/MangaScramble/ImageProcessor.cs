@@ -16,6 +16,13 @@ public class ChapterManifestEntry
     public string Slug { get; set; } = "";
     public int Grid { get; set; }
     public int FileCount { get; set; }
+    // Natural-sort position of this chapter among the input folder's chapters at
+    // the time it was (re-)recorded. Sync (MangaSyncService.cs) orders chapters by
+    // this instead of parsing a number out of Original — parsing broke on chapter
+    // names containing very long digit runs (OverflowException), and can't be
+    // trusted for ordering anyway once names get inconsistent. Nullable so
+    // manifests written before this field existed still parse.
+    public int? Order { get; set; }
 }
 
 /// <summary>
@@ -164,12 +171,11 @@ public static class ImageProcessor
         WriteIndented = true
     };
 
-    // Generate a unique chapter slug identical in shape to the web tool:
-    // "chapter-" + 6 random bytes as 12 lowercase hex chars.
+    // Generate 6 random bytes as a 12-character lowercase hex chapter slug.
     private static string NewSlug()
     {
         var bytes = RandomNumberGenerator.GetBytes(6);
-        return "chapter-" + Convert.ToHexString(bytes).ToLowerInvariant();
+        return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
     // Direct image files inside a folder (non-recursive), natural-sorted by name to
@@ -186,8 +192,19 @@ public static class ImageProcessor
     /// <summary>
     /// Per-chapter scramble matching the web tool. Each direct subfolder of the input =
     /// one chapter (if none, the input folder itself is one chapter). Every chapter gets
-    /// a unique slug and is scrambled with key "masterKey:slug", written as
-    /// &lt;output&gt;/&lt;slug&gt;/NNN.png (PNG lossless). A manifest.json is written at the output root.
+    /// a unique slug and is scrambled with key HMAC-SHA256(masterKey, slug) (see
+    /// ScrambleAlgorithm.DeriveChapterKey), written as
+    /// &lt;output&gt;/&lt;slug&gt;/NNN.png (PNG lossless).
+    ///
+    /// Checkpoint/resume (matches the web tool's runScrambleDrive): if
+    /// &lt;output&gt;/manifest.json already exists, chapters it lists are treated as done
+    /// and skipped — as long as the recorded FileCount still matches the current input
+    /// AND the chapter's slug folder is still present on disk. A stale entry (folder
+    /// missing/incomplete) is NOT trusted; that chapter is regenerated with a fresh slug.
+    /// Only chapters that still need work get a new slug/key; the manifest is
+    /// checkpointed to disk after every chapter, so a crash/cancel partway through
+    /// leaves a safely resumable state instead of orphaned, unmanifested output.
+    /// If no manifest.json exists yet, every chapter starts fresh (original behavior).
     /// </summary>
     public static async Task<int> ScramblePerChapterAsync(
         string inputFolder,
@@ -209,27 +226,65 @@ public static class ImageProcessor
             .ToArray();
         var chapterDirs = subDirs.Length > 0 ? subDirs : new[] { inputFolder };
 
-        // Pre-scan files per chapter for an accurate progress total.
+        // Pre-scan files per chapter for an accurate progress total. Index into this
+        // list is each chapter's natural-sort position (chapterDirs is already sorted
+        // by NaturalComparer above) — recorded as Order on its manifest entry below.
         var chapters = new List<(string name, string[] files)>();
-        int total = 0;
         foreach (var dir in chapterDirs)
         {
             var files = GetDirectImageFiles(dir);
             if (files.Length == 0) continue;
             chapters.Add((Path.GetFileName(dir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)), files));
+        }
+
+        // Existing checkpoint, if any. A missing/unreadable manifest.json just means
+        // this is a fresh run — every chapter below falls into the "needs work" path.
+        var manifestPath = Path.Combine(outputFolder, "manifest.json");
+        var existingEntries = new List<ChapterManifestEntry>();
+        if (File.Exists(manifestPath))
+        {
+            try
+            {
+                existingEntries = JsonSerializer.Deserialize<List<ChapterManifestEntry>>(
+                    File.ReadAllText(manifestPath), ManifestJsonOptions) ?? new List<ChapterManifestEntry>();
+            }
+            catch (JsonException)
+            {
+                existingEntries = new List<ChapterManifestEntry>();
+            }
+        }
+        var byOriginal = existingEntries.ToDictionary(e => e.Original, e => e);
+        var chapterOrder = chapters.Select((c, i) => (c.name, i)).ToDictionary(x => x.name, x => x.i);
+
+        // Decide skip vs. process before touching any files, and size the progress
+        // total to only the chapters that actually still need work.
+        var plan = new List<(string name, string[] files, bool skip, ChapterManifestEntry? existing)>();
+        int total = 0;
+        foreach (var (name, files) in chapters)
+        {
+            if (byOriginal.TryGetValue(name, out var existing)
+                && existing.FileCount == files.Length
+                && Directory.Exists(Path.Combine(outputFolder, existing.Slug)))
+            {
+                plan.Add((name, files, true, existing));
+                continue;
+            }
+            plan.Add((name, files, false, null));
             total += files.Length;
         }
 
-        var manifest = new List<ChapterManifestEntry>();
+        var manifest = new List<ChapterManifestEntry>(existingEntries.Where(e => byOriginal.ContainsKey(e.Original)));
         int processed = 0;
 
         await Task.Run(() =>
         {
-            foreach (var (name, files) in chapters)
+            foreach (var (name, files, skip, _) in plan)
             {
                 ct.ThrowIfCancellationRequested();
+                if (skip) continue;
+
                 var slug = NewSlug();
-                var key = $"{baseKey}:{slug}";
+                var key = ScrambleAlgorithm.DeriveChapterKey(baseKey, slug);
                 var outChapterDir = Path.Combine(outputFolder, slug);
                 Directory.CreateDirectory(outChapterDir);
 
@@ -246,20 +301,32 @@ public static class ImageProcessor
                     progress?.Report((processed, total, $"{name} → {slug}"));
                 }
 
-                manifest.Add(new ChapterManifestEntry { Original = name, Slug = slug, Grid = grid, FileCount = files.Length });
+                // Remove any prior (now-superseded) entry for this chapter before adding
+                // the fresh one — happens only when the old slug folder was missing/stale.
+                manifest.RemoveAll(e => e.Original == name);
+                manifest.Add(new ChapterManifestEntry { Original = name, Slug = slug, Grid = grid, FileCount = files.Length, Order = chapterOrder[name] });
+                File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, ManifestJsonOptions));
             }
-
-            var manifestPath = Path.Combine(outputFolder, "manifest.json");
-            File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, ManifestJsonOptions));
         }, ct);
+
+        // Backfill Order on entries that were skipped (already checkpointed from a
+        // prior run, possibly before this field existed) so every entry in the final
+        // manifest reflects the CURRENT input's natural-sort position — the set of
+        // chapters can change between runs (insertions/deletions), so a stale Order
+        // captured on a previous run could otherwise silently misorder sync.
+        foreach (var entry in manifest)
+        {
+            if (chapterOrder.TryGetValue(entry.Original, out var order)) entry.Order = order;
+        }
+        File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, ManifestJsonOptions));
 
         return processed;
     }
 
     /// <summary>
-    /// Per-chapter unscramble: reads &lt;input&gt;/manifest.json, and for each entry uses
-    /// key "masterKey:slug" + entry grid to restore &lt;input&gt;/&lt;slug&gt;/* back to
-    /// &lt;output&gt;/&lt;original&gt;/NNN.png. Verifies that a scramble round-trips.
+    /// Per-chapter unscramble: reads &lt;input&gt;/manifest.json, and for each entry derives
+    /// key = HMAC-SHA256(masterKey, entry.Slug) via DeriveChapterKey, then uses entry.Grid
+    /// to restore &lt;input&gt;/&lt;slug&gt;/* back to &lt;output&gt;/&lt;original&gt;/NNN.png.
     /// </summary>
     public static async Task<int> UnscramblePerChapterAsync(
         string inputFolder,
@@ -298,7 +365,7 @@ public static class ImageProcessor
             foreach (var (entry, files) in chapters)
             {
                 ct.ThrowIfCancellationRequested();
-                var key = $"{baseKey}:{entry.Slug}";
+                var key = ScrambleAlgorithm.DeriveChapterKey(baseKey, entry.Slug);
                 var outChapterDir = Path.Combine(outputFolder, entry.Original);
                 Directory.CreateDirectory(outChapterDir);
 

@@ -1,8 +1,7 @@
 // Core scramble/unscramble permutation logic.
 // Single source of truth shared by the reader (UnscrambleImage) and the admin
-// scramble tool (AdminScrambleTab), so both produce/consume the exact same
-// permutation. Mirrors the C# tool (scramble/MangaScramble/ScrambleAlgorithm.cs)
-// — FNV-1a seed + Mulberry32 PRNG + Fisher-Yates — for cross-platform parity.
+// scramble tool (AdminScrambleTab). The server derives each chapter key; this
+// module turns that key into a deterministic tile permutation.
 
 export function getSeedFromKey(key: string): number {
   let hash = 2166136261 >>> 0

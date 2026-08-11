@@ -18,11 +18,13 @@ public class AdminRootFoldersController : ControllerBase
 {
     private readonly AppDbContext _db;
     private readonly IGoogleDriveService _drive;
+    private readonly ILogger<AdminRootFoldersController> _logger;
 
-    public AdminRootFoldersController(AppDbContext db, IGoogleDriveService drive)
+    public AdminRootFoldersController(AppDbContext db, IGoogleDriveService drive, ILogger<AdminRootFoldersController> logger)
     {
         _db = db;
         _drive = drive;
+        _logger = logger;
     }
 
     [HttpGet]
@@ -86,6 +88,21 @@ public class AdminRootFoldersController : ControllerBase
             }
         }
         await _db.SaveChangesAsync();
+
+        // Explicitly remove dependent data before removing the mangas themselves —
+        // matches AdminMangasController.Delete. Don't rely solely on DB-level cascade
+        // (which requires SQLite FK enforcement to be on) or EF's in-memory cascade
+        // (which only reaches entities actually loaded into the change tracker).
+        var mangaIds = mangasInRoot.Select(m => m.Id).ToList();
+        var chapters = await _db.Chapters.Where(c => mangaIds.Contains(c.MangaId)).ToListAsync();
+        var chapterIds = chapters.Select(c => c.Id).ToList();
+        _db.ChapterImages.RemoveRange(_db.ChapterImages.Where(ci => chapterIds.Contains(ci.ChapterId)));
+        _db.Chapters.RemoveRange(chapters);
+        _db.Comments.RemoveRange(_db.Comments.Where(c => mangaIds.Contains(c.MangaId)));
+        _db.Favorites.RemoveRange(_db.Favorites.Where(f => mangaIds.Contains(f.MangaId)));
+        _db.ReadingHistories.RemoveRange(_db.ReadingHistories.Where(r => mangaIds.Contains(r.MangaId)));
+        _db.UserMangaPermissions.RemoveRange(_db.UserMangaPermissions.Where(p => mangaIds.Contains(p.MangaId)));
+        _db.Mangas.RemoveRange(mangasInRoot);
 
         _db.RootFolders.Remove(folder);
         await _db.SaveChangesAsync();
@@ -166,7 +183,29 @@ public class AdminRootFoldersController : ControllerBase
                     .Select(c => c.DriveFileId)
                     .ToListAsync();
                 var existingSet = existingDriveIds.ToHashSet();
-                var newChapters = driveFolders.Where(f => !existingSet.Contains(f.Id)).Select(f => f.Name).ToList();
+                var unmatched = driveFolders.Where(f => !existingSet.Contains(f.Id)).ToList();
+                if (unmatched.Count == 0) continue;
+
+                // A folder named like a scramble slug (chapter-xxxxxxxxxxxx) with no
+                // matching Chapter row is usually not a "new" chapter waiting to be
+                // synced — MangaSyncService intentionally skips slug folders that have
+                // no manifest.json entry yet (checkpoint upload still in progress, or
+                // an aborted upload left an orphan folder behind). Without this same
+                // check here, such an orphan gets flagged as "new" forever, since sync
+                // will keep skipping it every single run. Only fetch manifest.json when
+                // there's actually an unmatched slug-shaped folder to disambiguate.
+                HashSet<string>? manifestSlugs = null;
+                var newChapters = new List<string>();
+                foreach (var f in unmatched)
+                {
+                    if (ScrambleManifestUtil.SlugPattern.IsMatch(f.Name))
+                    {
+                        manifestSlugs ??= await ScrambleManifestUtil.ReadManifestSlugsAsync(
+                            _drive, await _drive.ListFilesAsync(manga.DriveFileId));
+                        if (!manifestSlugs.Contains(f.Name)) continue; // orphan, not new
+                    }
+                    newChapters.Add(f.Name);
+                }
 
                 if (newChapters.Count > 0)
                 {
@@ -235,5 +274,31 @@ public class AdminRootFoldersController : ControllerBase
         if (folder == null) return NotFound();
         await SyncBackgroundService.Queue.Writer.WriteAsync(new SyncRequest(id, SyncRequestType.RootFolder));
         return Accepted();
+    }
+
+    /// <summary>
+    /// On-demand version of AutoSyncService's 30-minute shared-folder scan. Lets a
+    /// caller (e.g. the scramble tool, right after it shares a freshly-uploaded manga
+    /// folder with the service account) surface a newly-shared root immediately instead
+    /// of waiting for the next timer tick.
+    ///
+    /// Retries with backoff: Drive's `sharedWithMe` search index is eventually
+    /// consistent, so a permission that just committed via Permissions.create can take
+    /// several seconds to tens of seconds before it shows up in ListSharedFoldersAsync's
+    /// query. A single immediate scan reliably races that index and comes back empty —
+    /// this loop rides out that window instead of relying solely on the 30-minute timer.
+    /// </summary>
+    [HttpPost("detect-new-shared")]
+    public async Task<IActionResult> DetectNewShared()
+    {
+        var delaysMs = new[] { 0, 3000, 5000, 8000, 15000 };
+        int queued = 0;
+        foreach (var delay in delaysMs)
+        {
+            if (delay > 0) await Task.Delay(delay, HttpContext.RequestAborted);
+            queued = await AutoSyncService.DetectNewSharedFolders(_db, _drive, _logger, HttpContext.RequestAborted);
+            if (queued > 0) break;
+        }
+        return Ok(new { queued });
     }
 }

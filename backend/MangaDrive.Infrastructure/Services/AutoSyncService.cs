@@ -61,7 +61,7 @@ public class AutoSyncService : BackgroundService
         int totalQueued = 0;
 
         // === Step 1: Detect new shared root folders ===
-        totalQueued += await DetectNewSharedFolders(db, drive, ct);
+        totalQueued += await DetectNewSharedFolders(db, drive, _logger, ct);
 
         // === Step 2: Get all active root folders ===
         var rootFolders = await db.RootFolders
@@ -248,23 +248,29 @@ public class AutoSyncService : BackgroundService
     }
 
     /// <summary>
-    /// Detects new shared folders on Drive that are not yet registered as root folders.
+    /// Detects new shared folders on Drive that are not yet registered as root folders,
+    /// and removes auto-added root folders that are no longer shared (deleted/unshared
+    /// directly on Drive). Manually-added roots (IsAutoAdded == false) are never touched
+    /// here — only Drive's shared-folder list governs auto-added ones.
+    ///
+    /// Static + a passed-in logger so this can also be called on-demand from
+    /// AdminRootFoldersController (e.g. right after the scramble tool shares a freshly
+    /// uploaded manga folder) instead of only on AutoSyncService's 30-minute timer.
     /// </summary>
-    private async Task<int> DetectNewSharedFolders(AppDbContext db, IGoogleDriveService drive, CancellationToken ct)
+    public static async Task<int> DetectNewSharedFolders(AppDbContext db, IGoogleDriveService drive, ILogger logger, CancellationToken ct = default)
     {
         int queued = 0;
         try
         {
             var sharedFolders = await drive.ListSharedFoldersAsync();
-            _logger.LogInformation(
+            logger.LogInformation(
                 "Auto sync: Drive returned {Count} shared folder(s): {Names}",
                 sharedFolders.Count,
                 string.Join(", ", sharedFolders.Select(f => $"{f.Name} ({f.Id})")));
 
-            var existingRootDriveIds = await db.RootFolders
-                .Select(rf => rf.GoogleDriveFolderId)
-                .ToListAsync(ct);
-            var existingSet = existingRootDriveIds.ToHashSet();
+            var sharedIds = sharedFolders.Select(f => f.Id).ToHashSet();
+            var existingRoots = await db.RootFolders.ToListAsync(ct);
+            var existingSet = existingRoots.Select(rf => rf.GoogleDriveFolderId).ToHashSet();
 
             foreach (var shared in sharedFolders)
             {
@@ -281,16 +287,65 @@ public class AutoSyncService : BackgroundService
                 db.RootFolders.Add(newRoot);
                 await db.SaveChangesAsync(ct);
 
-                _logger.LogInformation("Auto sync: new shared folder '{Name}' detected, added and queueing sync", shared.Name);
+                logger.LogInformation("Auto sync: new shared folder '{Name}' detected, added and queueing sync", shared.Name);
                 await SyncBackgroundService.Queue.Writer.WriteAsync(
                     new SyncRequest(newRoot.Id, SyncRequestType.RootFolder), ct);
                 queued++;
             }
+
+            // Reverse direction: an auto-added root that Drive no longer lists as shared
+            // was deleted/unshared directly on Drive, bypassing the admin's Delete
+            // endpoint entirely — nothing else in the codebase ever detects this, so the
+            // root (and its mangas/chapters) would otherwise sit "active" forever, failing
+            // every sync attempt. Clean it up the same way AdminRootFoldersController.Delete
+            // does. Manually-added roots are left alone since Drive's shared list can't
+            // speak for them.
+            var goneRoots = existingRoots.Where(rf => rf.IsAutoAdded && !sharedIds.Contains(rf.GoogleDriveFolderId)).ToList();
+            foreach (var root in goneRoots)
+            {
+                await RemoveRootFolderAndContents(db, root, ct);
+                logger.LogInformation("Auto sync: root folder '{Name}' no longer shared on Drive, removed", root.Name);
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogWarning(ex, "Auto sync: failed to scan shared folders");
+            logger.LogWarning(ex, "Auto sync: failed to scan shared folders");
         }
         return queued;
+    }
+
+    /// <summary>
+    /// Deletes a root folder and every dependent row (mangas, chapters, chapter images,
+    /// comments, favorites, reading histories, permissions). Mirrors
+    /// AdminRootFoldersController.Delete's explicit cleanup — kept in sync with it rather
+    /// than relying solely on DB-level cascade, since this runs from a background service
+    /// with no HTTP caller to surface a failure to.
+    /// </summary>
+    private static async Task RemoveRootFolderAndContents(AppDbContext db, MangaRootFolder root, CancellationToken ct)
+    {
+        var mangaIds = await db.Mangas.Where(m => m.RootFolderId == root.Id).Select(m => m.Id).ToListAsync(ct);
+
+        // Linked mangas pointing at a primary in this root need a new primary promoted,
+        // same as AdminRootFoldersController.Delete, so they don't end up dangling.
+        foreach (var mangaId in mangaIds)
+        {
+            var linkedMangas = await db.Mangas.Where(m => m.LinkedMangaId == mangaId).ToListAsync(ct);
+            if (linkedMangas.Count == 0) continue;
+            var newPrimary = linkedMangas[0];
+            newPrimary.LinkedMangaId = null;
+            for (int i = 1; i < linkedMangas.Count; i++)
+                linkedMangas[i].LinkedMangaId = newPrimary.Id;
+        }
+
+        var chapterIds = await db.Chapters.Where(c => mangaIds.Contains(c.MangaId)).Select(c => c.Id).ToListAsync(ct);
+        db.ChapterImages.RemoveRange(db.ChapterImages.Where(ci => chapterIds.Contains(ci.ChapterId)));
+        db.Chapters.RemoveRange(db.Chapters.Where(c => mangaIds.Contains(c.MangaId)));
+        db.Comments.RemoveRange(db.Comments.Where(c => mangaIds.Contains(c.MangaId)));
+        db.Favorites.RemoveRange(db.Favorites.Where(f => mangaIds.Contains(f.MangaId)));
+        db.ReadingHistories.RemoveRange(db.ReadingHistories.Where(r => mangaIds.Contains(r.MangaId)));
+        db.UserMangaPermissions.RemoveRange(db.UserMangaPermissions.Where(p => mangaIds.Contains(p.MangaId)));
+        db.Mangas.RemoveRange(db.Mangas.Where(m => mangaIds.Contains(m.Id)));
+        db.RootFolders.Remove(root);
+        await db.SaveChangesAsync(ct);
     }
 }

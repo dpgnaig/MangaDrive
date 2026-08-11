@@ -18,7 +18,8 @@ public record MetadataCandidate(
     List<string> Genres,
     string? CoverUrl,
     string? BannerUrl,
-    string? DetailUrl
+    string? DetailUrl,
+    bool? IsNSFW = null
 );
 
 public interface IMetadataService

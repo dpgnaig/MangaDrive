@@ -6,6 +6,7 @@ import { useMessenger } from '../context/MessengerContext'
 import NotificationBell from './NotificationBell'
 import SearchDrawer from './SearchDrawer'
 import MessengerPanel from './messenger/MessengerPanel'
+import UploadStatusMenu from './UploadStatusMenu'
 import { useIsDesktop } from '../hooks/useBreakpoint'
 
 export default function TopNav({ showSearch = true }: { showSearch?: boolean }) {
@@ -49,6 +50,8 @@ export default function TopNav({ showSearch = true }: { showSearch?: boolean }) 
           </Badge>
           {isDesktop && panelOpen && <MessengerPanel anchorRef={msgBtnRef} />}
         </div>
+
+        <UploadStatusMenu />
 
         <span className="desktop-only"><NotificationBell /></span>
 

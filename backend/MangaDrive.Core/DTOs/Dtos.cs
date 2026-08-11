@@ -43,9 +43,9 @@ public record CreateRootFolderRequest(string Name, string GoogleDriveFolderId, b
 
 public record UpdateRootFolderRequest(string Name, bool IsPublic, bool IsActive);
 
-public record MangaDto(Guid Id, string Title, string OtherTitles, string Description, string Author, string Status, string Genres, string CoverImageFileId, string BannerImageFileId, int ChapterCount, string? LatestChapter, DateTime UpdatedAt, int ViewCount, string? LatestChapterNumber = null);
+public record MangaDto(Guid Id, string Title, string OtherTitles, string Description, string Author, string Status, string Genres, string CoverImageFileId, string BannerImageFileId, int ChapterCount, string? LatestChapter, DateTime UpdatedAt, int ViewCount, string? LatestChapterNumber = null, bool? IsNSFW = null);
 
-public record ChapterDto(Guid Id, string Name, int SortOrder, int ImageCount, string? ChapterNumber = null, string? ChapterName = null);
+public record ChapterDto(Guid Id, string Name, int SortOrder, int ImageCount, string? ChapterNumber = null, string? ChapterName = null, string? Slug = null);
 
 public record ChapterDetailDto(Guid Id, Guid MangaId, string Name, int SortOrder, List<ChapterImageDto> Images, bool IsScrambled);
 

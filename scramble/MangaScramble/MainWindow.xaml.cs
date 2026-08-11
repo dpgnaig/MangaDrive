@@ -20,7 +20,7 @@ public partial class MainWindow : Window
         LoadConfig();
         Log("MangaDrive Image Scramble Tool ready.");
         Log("Thuật toán: Mulberry32 PRNG + Fisher-Yates shuffle (cross-platform với JS/web).");
-        Log("Chế độ per-chapter: mỗi subfolder = 1 chapter, xáo bằng masterKey:slug, output PNG + manifest.json.");
+        Log("Chế độ per-chapter: mỗi subfolder = 1 chapter, xáo bằng HMAC-SHA256(masterKey, slug), output PNG + manifest.json (tự resume nếu manifest.json đã có).");
         Log($"Config file: {ConfigPath}");
     }
 
@@ -210,10 +210,17 @@ public partial class MainWindow : Window
             if (warn != MessageBoxResult.Yes) return;
         }
 
-        if (Directory.Exists(outputFolder) && Directory.GetFiles(outputFolder, "*", SearchOption.AllDirectories).Length > 0)
+        // Scramble mode with an existing manifest.json resumes: chapters already
+        // checkpointed (same file count, slug folder present) are skipped, only
+        // missing/incomplete ones are (re)generated with a fresh slug. Unscramble
+        // always needs an existing manifest (checked above) so this only warns
+        // when scrambling into a non-empty folder with no manifest yet.
+        if (isScrambleMode && Directory.Exists(outputFolder)
+            && Directory.GetFiles(outputFolder, "*", SearchOption.AllDirectories).Length > 0
+            && !File.Exists(Path.Combine(outputFolder, "manifest.json")))
         {
             var result = System.Windows.MessageBox.Show(
-                "Thư mục output đã có file. Tiếp tục sẽ ghi đè. Bạn có muốn tiếp tục?",
+                "Thư mục output đã có file nhưng không có manifest.json. Tiếp tục sẽ ghi đè/xáo mới hoàn toàn. Bạn có muốn tiếp tục?",
                 "Xác nhận", MessageBoxButton.YesNo, MessageBoxImage.Question);
             if (result != MessageBoxResult.Yes) return;
         }

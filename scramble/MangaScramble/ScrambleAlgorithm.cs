@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+
 namespace MangaScramble;
 
 /// <summary>
@@ -45,6 +48,19 @@ public static class ScrambleAlgorithm
             inverse[perm[i]] = i;
         }
         return inverse;
+    }
+
+    /// <summary>
+    /// Derive the per-chapter key = HMAC-SHA256(masterKey, slug) as a lowercase hex
+    /// string. Must stay byte-identical to the JS deriveChapterKey
+    /// (frontend/src/lib/scramble.ts) and the backend derivation, or the reader and
+    /// the scramble tool will disagree on the permutation.
+    /// </summary>
+    public static string DeriveChapterKey(string masterKey, string slug)
+    {
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(masterKey));
+        var sig = hmac.ComputeHash(Encoding.UTF8.GetBytes(slug));
+        return Convert.ToHexString(sig).ToLowerInvariant();
     }
 
     /// <summary>

@@ -175,9 +175,23 @@ public class MangaSyncService : IMangaSyncService
             }
         }
 
-        // Sync chapters
+        // Per-chapter scramble manifest: Drive folders use opaque slugs, while the
+        // real chapter name, number, grid and ordering live in manifest.json.
+        // Map the exact slug (including any legacy prefix) to its entry.
+        var scrambleManifest = await ReadScrambleManifest(files, manga.Id, ct);
+
+        // Sync chapters. Prefer the manifest's Order (natural-sort position recorded
+        // at scramble time) — parsing a number out of Original/the folder name is
+        // only a fallback for legacy manifests/entries that predate the Order field,
+        // since that parsing is unreliable once names get inconsistent (and used to
+        // throw OverflowException on names with very long digit runs).
         var chapterFolders = (await _drive.ListFoldersAsync(manga.DriveFileId))
-            .OrderBy(f => ExtractNumber(f.Name)).ToList();
+            .OrderBy(f =>
+            {
+                scrambleManifest.TryGetValue(f.Name, out var e);
+                return e?.Order ?? ExtractNumber(e?.Original ?? f.Name);
+            })
+            .ToList();
         _syncedChaptersBeforeCurrentManga = job.SyncedChapter;
         _currentMangaChapterCount = chapterFolders.Count;
         _currentMangaNewChapters = 0;
@@ -193,19 +207,40 @@ public class MangaSyncService : IMangaSyncService
             job.CurrentChapter = cf.Name;
             await SaveAndNotify(job, rootName);
 
+            // For scrambled uploads the Drive folder is named by slug; the human
+            // chapter name/number lives in the manifest entry. Fall back to the
+            // folder name for legacy (unscrambled) folders with no manifest.
+            scrambleManifest.TryGetValue(cf.Name, out var manifestEntry);
+
+            // A slug-named folder with no manifest entry means the checkpoint
+            // upload (AdminScrambleTab.tsx) created the Drive folder but hasn't
+            // PATCHed manifest.json yet — sync ran mid-upload. Skip this folder
+            // for now instead of falling back to the raw slug as a display name
+            // (which regexes into a meaningless "chapter number"); the next sync
+            // pass will see the completed manifest and pick it up correctly.
+            if (manifestEntry == null && ScrambleManifestUtil.SlugPattern.IsMatch(cf.Name))
+            {
+                job.SyncedChapter++;
+                await SaveAndNotify(job, rootName);
+                continue;
+            }
+
+            var displayName = manifestEntry?.Original ?? cf.Name;
+
             var chapter = await _db.Chapters.FirstOrDefaultAsync(
                 c => c.MangaId == manga.Id && c.DriveFileId == cf.Id, ct);
             if (chapter == null)
             {
-                var extractedNumber = ExtractChapterNumber(cf.Name);
-                var extractedName = ExtractChapterName(cf.Name);
                 chapter = new Chapter
                 {
                     MangaId = manga.Id,
                     DriveFileId = cf.Id,
-                    Name = cf.Name,
-                    ChapterNumber = extractedNumber,
-                    ChapterName = extractedName,
+                    Name = displayName,
+                    ChapterNumber = ExtractChapterNumber(displayName),
+                    ChapterName = ExtractChapterName(displayName),
+                    Slug = manifestEntry?.Slug,
+                    Grid = manifestEntry?.Grid,
+                    ManifestOrder = manifestEntry?.Order,
                     SortOrder = i
                 };
                 _db.Chapters.Add(chapter);
@@ -215,8 +250,24 @@ public class MangaSyncService : IMangaSyncService
             }
             else
             {
-                // Backfill: if existing chapter has no ChapterNumber, extract from Name
-                if (chapter.ChapterNumber == null)
+                // manifest.json is the durable source of truth for a scrambled chapter's
+                // name/number/order — resync Name/ChapterNumber/ChapterName/SortOrder/
+                // ManifestOrder from it on every sync (not just once), so a stale override
+                // left by e.g. the admin "Import chapter" paste-JSON flow self-heals on the
+                // next sync instead of sticking around indefinitely. Chapters with no
+                // manifest entry (never scrambled) are untouched here — Import chapter is
+                // their only source of a clean name, so only backfill when still unset.
+                if (manifestEntry != null)
+                {
+                    chapter.Name = displayName;
+                    chapter.ChapterNumber = ExtractChapterNumber(displayName);
+                    chapter.ChapterName = ExtractChapterName(displayName);
+                    chapter.SortOrder = i;
+                    chapter.Slug ??= manifestEntry.Slug;
+                    chapter.Grid ??= manifestEntry.Grid;
+                    chapter.ManifestOrder = manifestEntry.Order;
+                }
+                else if (chapter.ChapterNumber == null)
                 {
                     chapter.ChapterNumber = ExtractChapterNumber(chapter.Name);
                     chapter.ChapterName = ExtractChapterName(chapter.Name);
@@ -317,7 +368,7 @@ public class MangaSyncService : IMangaSyncService
             .ToListAsync(ct);
 
         var sorted = chapters
-            .OrderBy(c => ExtractNumber(c.Name))
+            .OrderBy(c => c.ManifestOrder ?? ExtractNumber(c.Name))
             .ThenBy(c => c.Name)
             .ToList();
 
@@ -388,6 +439,45 @@ public class MangaSyncService : IMangaSyncService
         }
 
         manga.UpdatedAt = manga.UpdatedAt == default ? DateTime.UtcNow : manga.UpdatedAt;
+    }
+
+    // Order: natural-sort position of this chapter in the input folder at scramble
+    // time, written by AdminScrambleTab.tsx / the desktop scramble tool. Sync
+    // prefers this over parsing a number out of Original — parsing broke on chapter
+    // names with very long digit runs (OverflowException) and can't be trusted once
+    // names get inconsistent. Nullable so manifests written before this field
+    // existed (or entries missing it) still parse and fall back to ExtractNumber.
+    private record ScrambleManifestEntry(string Original, string Slug, int Grid, int FileCount, int? Order = null);
+
+    /// <summary>
+    /// Read the scramble manifest.json at the manga folder root (written by the
+    /// scramble tools). Returns a map keyed by slug — the Drive folder for each
+    /// scrambled chapter is named by its slug, so sync looks entries up by folder
+    /// name. Returns an empty map for legacy (unscrambled) mangas with no manifest.
+    /// </summary>
+    private async Task<Dictionary<string, ScrambleManifestEntry>> ReadScrambleManifest(
+        List<DriveFile> files, Guid mangaId, CancellationToken ct)
+    {
+        var manifestFile = files.FirstOrDefault(f => f.Name == "manifest.json");
+        if (manifestFile == null) return new();
+
+        try
+        {
+            var json = await _drive.GetFileContentAsync(manifestFile.Id);
+            if (string.IsNullOrEmpty(json)) return new();
+
+            var entries = JsonSerializer.Deserialize<List<ScrambleManifestEntry>>(json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new();
+            return entries
+                .Where(e => !string.IsNullOrEmpty(e.Slug))
+                .GroupBy(e => e.Slug)
+                .ToDictionary(g => g.Key, g => g.First());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read scramble manifest for manga {Id}", mangaId);
+            return new();
+        }
     }
 
     private int _currentMangaChapterCount;
@@ -482,10 +572,18 @@ public class MangaSyncService : IMangaSyncService
         return JsonSerializer.Serialize(result, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
     }
 
+    // A name/number too long to fit Int32 (e.g. a stray long digit run in a folder
+    // name) used to throw OverflowException here and crash the whole sync job.
+    // TryParse + fallback to MaxValue means such a chapter just sorts last instead.
+    // A name with NO digits at all (e.g. "Chương Oneshot - Joker") also falls back
+    // to MaxValue rather than 0 — 0 used to make such chapters sort as if they were
+    // chapter 0, which (combined with the reader's newest-first display) made them
+    // appear to vanish at the bottom of long chapter lists instead of showing up.
     private static int ExtractNumber(string name)
     {
         var match = Regex.Match(name, @"\d+");
-        return match.Success ? int.Parse(match.Value) : 0;
+        if (!match.Success) return int.MaxValue;
+        return int.TryParse(match.Value, out var n) ? n : int.MaxValue;
     }
 
     /// <summary>

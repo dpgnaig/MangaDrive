@@ -10,8 +10,20 @@ using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// "Foreign Keys=True" turns on SQLite's FK enforcement (off by default), which is
+// what makes the ON DELETE CASCADE clauses already baked into the migrations
+// actually fire. Without it, deleting a RootFolder/Manga leaves every dependent
+// row (Chapters, Comments, Favorites, ...) that isn't explicitly loaded into the
+// EF change tracker orphaned in the DB forever.
 builder.Services.AddDbContext<AppDbContext>(o =>
-    o.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
+{
+    var connectionString = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(
+        builder.Configuration.GetConnectionString("DefaultConnection"))
+    {
+        ForeignKeys = true
+    }.ToString();
+    o.UseSqlite(connectionString);
+});
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(o =>
@@ -63,6 +75,29 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     });
 
 builder.Services.AddAuthorization();
+
+// Per-user rate limit for the scramble-key endpoint: throttles bulk enumeration of
+// per-chapter keys while leaving normal sequential reading unaffected. Partitioned
+// on the authenticated user id (falls back to remote IP for unauthenticated calls).
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("scramble-key", httpContext =>
+    {
+        var partitionKey = httpContext.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+            ?? httpContext.Connection.RemoteIpAddress?.ToString()
+            ?? "anonymous";
+        return System.Threading.RateLimiting.RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey,
+            _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 20,
+                Window = TimeSpan.FromSeconds(10),
+                QueueLimit = 0
+            });
+    });
+});
+
 builder.Services.AddControllers()
     .AddJsonOptions(o =>
     {
@@ -384,26 +419,40 @@ using (var scope = app.Services.CreateScope())
     try { db.Database.ExecuteSqlRaw("ALTER TABLE Users ADD COLUMN Birthday TEXT"); } catch { }
     try { db.Database.ExecuteSqlRaw("ALTER TABLE Users ADD COLUMN HasChangedName INTEGER NOT NULL DEFAULT 0"); } catch { }
 
-    // Auto-add shared folders from Drive
+    // Auto-add shared folders from Drive. Any folder registered here must also be
+    // queued for sync — otherwise it sits in RootFolders with zero mangas forever:
+    // AutoSyncService.DetectNewSharedFolders runs 2 minutes after startup and skips
+    // any Drive folder ID already present in RootFolders, so if THIS block is the one
+    // that first registers a newly-shared folder (it always runs first, since it's
+    // synchronous at startup vs. AutoSyncService's 2-minute delay), nothing else will
+    // ever trigger its initial sync.
     try
     {
         var drive = scope.ServiceProvider.GetRequiredService<IGoogleDriveService>();
         var sharedFolders = await drive.ListSharedFoldersAsync();
         var existingIds = db.RootFolders.Select(r => r.GoogleDriveFolderId).ToHashSet();
+        var newlyAddedRoots = new List<MangaDrive.Core.Entities.MangaRootFolder>();
         foreach (var sf in sharedFolders)
         {
             if (!existingIds.Contains(sf.Id))
             {
-                db.RootFolders.Add(new MangaDrive.Core.Entities.MangaRootFolder
+                var newRoot = new MangaDrive.Core.Entities.MangaRootFolder
                 {
                     Name = sf.Name,
                     GoogleDriveFolderId = sf.Id,
                     IsPublic = true,
                     IsAutoAdded = true
-                });
+                };
+                db.RootFolders.Add(newRoot);
+                newlyAddedRoots.Add(newRoot);
             }
         }
         db.SaveChanges();
+        foreach (var newRoot in newlyAddedRoots)
+        {
+            await SyncBackgroundService.Queue.Writer.WriteAsync(
+                new SyncRequest(newRoot.Id, SyncRequestType.RootFolder));
+        }
     }
     catch { /* Drive not available at startup - skip */ }
 
@@ -431,6 +480,7 @@ using (var scope = app.Services.CreateScope())
 app.UseCors();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 app.MapControllers();
 app.MapHub<SyncHub>("/hubs/sync");
 app.MapHub<CommentHub>("/hubs/comments");

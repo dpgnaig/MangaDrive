@@ -45,6 +45,24 @@ public class AdminMangasController : ControllerBase
         return Ok(new { manga.IsHidden });
     }
 
+    // Lets an admin correct the display title before running metadata search — useful
+    // when the Drive folder name has noise (release group tags, language markers) that
+    // throws off AniList/MangaDex matching. Only touches Title; the metadata-apply flow
+    // (AdminMetadataController) remains the path for updating every other field at once.
+    [HttpPatch("{id:guid}/title")]
+    public async Task<IActionResult> UpdateTitle(Guid id, [FromBody] UpdateTitleRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Title)) return BadRequest(new { message = "Tên manga không được để trống" });
+
+        var manga = await _db.Mangas.FindAsync(id);
+        if (manga == null) return NotFound();
+
+        manga.Title = req.Title.Trim();
+        manga.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+        return Ok(new { manga.Id, manga.Title });
+    }
+
     [HttpDelete("{id:guid}")]
     public async Task<IActionResult> Delete(Guid id)
     {
@@ -84,17 +102,49 @@ public class AdminMangasController : ControllerBase
         return NoContent();
     }
 
+    // Manual drag-and-drop reorder for one-off fixes (e.g. a couple of misordered
+    // chapters) without needing a full paste-able name/order list. chapterIds must be
+    // given newest-first (as displayed) — SortOrder is assigned in reverse so index 0
+    // gets the highest value, matching the reader/UI convention (higher SortOrder = newer).
+    // Manifest-backed chapters (Slug != null) are protected by default, same as
+    // ImportChapters: MangaSyncService resyncs SortOrder from manifest.json on every
+    // sync and would otherwise silently revert this. force bypasses that.
     [HttpPost("{mangaId:guid}/reorder-chapters")]
-    public async Task<IActionResult> ReorderChapters(Guid mangaId, [FromBody] List<Guid> chapterIds)
+    public async Task<IActionResult> ReorderChapters(Guid mangaId, [FromBody] List<Guid> chapterIds, [FromQuery] bool force = false)
     {
-        var chapters = await _db.Chapters.Where(c => c.MangaId == mangaId).ToListAsync();
+        var manga = await _db.Mangas.FindAsync(mangaId);
+        if (manga == null) return NotFound();
+
+        var allMangaIds = new List<Guid> { mangaId };
+        var linkedIds = await _db.Mangas.Where(m => m.LinkedMangaId == mangaId).Select(m => m.Id).ToListAsync();
+        allMangaIds.AddRange(linkedIds);
+        if (manga.LinkedMangaId != null)
+        {
+            var primaryId = manga.LinkedMangaId.Value;
+            allMangaIds = new List<Guid> { primaryId };
+            var otherLinked = await _db.Mangas.Where(m => m.LinkedMangaId == primaryId).Select(m => m.Id).ToListAsync();
+            allMangaIds.AddRange(otherLinked);
+        }
+
+        // Scope to this manga's group so a chapter id from another manga can't be
+        // smuggled in to have its SortOrder rewritten.
+        var chapters = await _db.Chapters
+            .Where(c => allMangaIds.Contains(c.MangaId) && chapterIds.Contains(c.Id))
+            .ToListAsync();
+        var chapterLookup = chapters.ToDictionary(c => c.Id);
+
+        var updated = 0;
+        var protectedByManifest = 0;
         for (int i = 0; i < chapterIds.Count; i++)
         {
-            var ch = chapters.FirstOrDefault(c => c.Id == chapterIds[i]);
-            if (ch != null) ch.SortOrder = i;
+            if (!chapterLookup.TryGetValue(chapterIds[i], out var chapter)) continue;
+            if (chapter.Slug != null && !force) { protectedByManifest++; continue; }
+            chapter.SortOrder = chapterIds.Count - 1 - i;
+            updated++;
         }
+
         await _db.SaveChangesAsync();
-        return Ok();
+        return Ok(new { total = chapterIds.Count, updated, protectedByManifest });
     }
 
     [HttpPost("{id:guid}/link")]
@@ -169,9 +219,13 @@ public class AdminMangasController : ControllerBase
             .Where(c => allMangaIds.Contains(c.MangaId))
             .ToListAsync();
 
-        // Sort by extracted number from chapter name
+        // Prefer ManifestOrder (natural-sort position recorded at scramble time —
+        // see MangaSyncService.ReorderLinkedChapters for why this is more trustworthy
+        // than parsing a number out of Name once chapter names get inconsistent).
+        // Falls back to ExtractNumber for chapters never scrambled, or scrambled
+        // before this field existed.
         var sorted = chapters
-            .OrderBy(c => ExtractNumber(c.Name))
+            .OrderBy(c => c.ManifestOrder ?? (int)ExtractNumber(c.Name))
             .ThenBy(c => c.Name)
             .ToList();
 
@@ -186,16 +240,28 @@ public class AdminMangasController : ControllerBase
     private static double ExtractNumber(string name)
     {
         var match = System.Text.RegularExpressions.Regex.Match(name, @"(\d+\.?\d*)");
-        return match.Success ? double.Parse(match.Value, System.Globalization.CultureInfo.InvariantCulture) : 0;
+        // No digits at all (e.g. "Chương Oneshot - Joker") sorts last, not as chapter 0 —
+        // see MangaSyncService.ExtractNumber for why falling back to 0 hid such chapters.
+        return match.Success ? double.Parse(match.Value, System.Globalization.CultureInfo.InvariantCulture) : double.MaxValue;
     }
 
-    [HttpPost("{mangaId:guid}/import-chapter-names")]
-    public async Task<IActionResult> ImportChapterNames(Guid mangaId, [FromBody] List<ImportChapterNameItem> items)
+    // Merges the previously-separate "import tên" and "import thứ tự" actions into
+    // one endpoint: an admin-supplied list is already both the source of truth for
+    // ordering (order 1 = newest) and, once matched, for the display name — so there
+    // is no separate case where only one of SortOrder/ChapterNumber/ChapterName needs
+    // updating. Matches by exact Chapter.Name (trusts the imported list verbatim,
+    // e.g. scraped from the original source site), which also makes a manual
+    // drag-and-drop "Sắp xếp" step unnecessary once a name/order list is available.
+    [HttpPost("{mangaId:guid}/import-chapters")]
+    public async Task<IActionResult> ImportChapters(Guid mangaId, [FromBody] List<ImportChapterItem> items, [FromQuery] bool force = false)
     {
         var manga = await _db.Mangas.FindAsync(mangaId);
         if (manga == null) return NotFound();
 
-        // Get all chapters for this manga + linked mangas
+        // Chapters live across this manga + everything linked to it (or, if this
+        // manga is itself linked, its primary + siblings) — same scope as
+        // ReorderLinkedChapters, since the chapter list is one logical sequence
+        // regardless of which underlying Manga row a chapter belongs to.
         var allMangaIds = new List<Guid> { mangaId };
         var linkedIds = await _db.Mangas
             .Where(m => m.LinkedMangaId == mangaId)
@@ -203,7 +269,6 @@ public class AdminMangasController : ControllerBase
             .ToListAsync();
         allMangaIds.AddRange(linkedIds);
 
-        // Also check if this manga is itself linked to a primary
         if (manga.LinkedMangaId != null)
         {
             var primaryId = manga.LinkedMangaId.Value;
@@ -217,61 +282,78 @@ public class AdminMangasController : ControllerBase
 
         var chapters = await _db.Chapters
             .Where(c => allMangaIds.Contains(c.MangaId))
-            .OrderBy(c => c.SortOrder)
             .ToListAsync();
 
-        // Build lookup: chapter number -> chapter entity
-        var chapterByNumber = chapters
-            .Select(c => new { Chapter = c, Number = ExtractNumber(c.Name) })
-            .GroupBy(x => x.Number)
-            .ToDictionary(g => g.Key, g => g.First().Chapter);
+        var chapterByName = chapters
+            .GroupBy(c => c.Name.Trim(), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
-        // Parse each label: "Ch.1 — Tên chapter" or "Ch.1: Tên chapter"
         var updated = 0;
+        var protectedByManifest = 0;
+        // Items whose name has no matching Chapter row — these aren't in the DB yet,
+        // i.e. not synced from Drive, so the caller can't have imported them for real.
+        // Surfaced back to the admin (as a downloadable list) instead of just a count,
+        // so they know exactly which chapters still need a Drive sync first.
+        var unsynced = new List<UnsyncedChapterItem>();
         foreach (var item in items)
         {
-            var number = ExtractNumber(item.Label);
-            if (chapterByNumber.TryGetValue(number, out var chapter))
+            var name = item.Name?.Trim();
+            if (string.IsNullOrEmpty(name) || !chapterByName.TryGetValue(name, out var chapter))
             {
-                // Extract chapter number string and chapter name from label
-                var chapterNumber = ExtractChapterNumberString(item.Label);
-                var chapterName = ExtractChapterName(item.Label);
-
-                chapter.ChapterNumber = chapterNumber;
-                chapter.ChapterName = chapterName;
-                updated++;
+                unsynced.Add(new UnsyncedChapterItem(item.Name, item.Order));
+                continue;
             }
+
+            // Manifest-backed chapters (scrambled uploads) get their Name/ChapterNumber/
+            // ChapterName/SortOrder from manifest.json on every sync (see MangaSyncService),
+            // so overwriting them here would just get reverted on the next sync anyway —
+            // skip them instead of silently no-op'ing via the name-mismatch path above.
+            // `force` bypasses this: used to one-time repair a manga whose manifest.json
+            // itself has bad ordering (e.g. two overlapping append batches) — the admin
+            // is explicitly asserting the pasted list is more correct than the manifest.
+            if (chapter.Slug != null && !force)
+            {
+                protectedByManifest++;
+                continue;
+            }
+
+            // order 1 = newest chapter, so SortOrder runs the opposite direction
+            // (higher SortOrder = newer, matching the rest of the reader/UI).
+            chapter.SortOrder = items.Count - item.Order;
+            chapter.ChapterNumber = ExtractChapterNumberString(name);
+            chapter.ChapterName = ExtractChapterName(name);
+            updated++;
         }
 
         await _db.SaveChangesAsync();
-        return Ok(new { total = items.Count, updated, skipped = items.Count - updated });
+        return Ok(new { total = items.Count, updated, protectedByManifest, skipped = unsynced.Count, unsynced });
     }
 
     /// <summary>
-    /// Extract chapter number string from label, e.g. "Ch.1 — ..." -> "1", "Ch.5.5 — ..." -> "5.5"
+    /// Extract chapter number string from a chapter name, e.g. "Chương 881: ..." -> "881",
+    /// "Ch.5.5 — ..." -> "5.5". A name with no digits (e.g. a oneshot) yields null.
     /// </summary>
-    private static string? ExtractChapterNumberString(string label)
+    private static string? ExtractChapterNumberString(string name)
     {
-        var match = System.Text.RegularExpressions.Regex.Match(label, @"Ch\.?\s*(\d+\.?\d*)");
+        var match = System.Text.RegularExpressions.Regex.Match(name, @"(\d+\.?\d*)");
         return match.Success ? match.Groups[1].Value : null;
     }
 
     /// <summary>
-    /// Extract chapter name from label after separator (— or : or -)
+    /// Extract chapter display name from a chapter name after separator (— or – or : or -)
+    /// "Chương 881: Trở về" -> "Trở về"
     /// "Ch.1 — Tên chapter" -> "Tên chapter"
-    /// "Ch.1: Tên chapter" -> "Tên chapter"
     /// </summary>
-    private static string? ExtractChapterName(string label)
+    private static string? ExtractChapterName(string name)
     {
-        // Try separators: " — ", " - ", ": "
-        var separators = new[] { " — ", " — ", " - ", ": " };
+        var separators = new[] { " — ", " – ", " - ", ": " };
         foreach (var sep in separators)
         {
-            var idx = label.IndexOf(sep);
+            var idx = name.IndexOf(sep, StringComparison.Ordinal);
             if (idx >= 0)
             {
-                var name = label[(idx + sep.Length)..].Trim();
-                return string.IsNullOrEmpty(name) ? null : name;
+                var result = name[(idx + sep.Length)..].Trim();
+                return string.IsNullOrEmpty(result) ? null : result;
             }
         }
         return null;
@@ -279,4 +361,6 @@ public class AdminMangasController : ControllerBase
 }
 
 public record LinkMangaRequest(Guid TargetMangaId);
-public record ImportChapterNameItem(string Label);
+public record ImportChapterItem(string Name, int Order);
+public record UnsyncedChapterItem(string? Name, int Order);
+public record UpdateTitleRequest(string Title);

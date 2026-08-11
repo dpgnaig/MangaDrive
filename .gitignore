@@ -33,3 +33,6 @@ db-backup/
 Thumbs.db
 .idea/
 .vscode/
+
+# Large generated download bundle, not part of source
+frontend/public/downloads/

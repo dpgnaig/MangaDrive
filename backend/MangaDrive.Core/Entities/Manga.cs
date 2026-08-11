@@ -14,6 +14,8 @@ public class Manga
     public string CoverImageFileId { get; set; } = string.Empty;
     public string BannerImageFileId { get; set; } = string.Empty;
     public bool IsHidden { get; set; }
+    // null = unknown/never set, true = NSFW, false = confirmed safe.
+    public bool? IsNSFW { get; set; }
     public Guid? LinkedMangaId { get; set; }
     public int ViewCount { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

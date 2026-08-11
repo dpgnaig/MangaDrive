@@ -1,7 +1,10 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
-import { Modal } from 'antd'
+import { Modal, message, Dropdown } from 'antd'
 import * as signalR from '@microsoft/signalr'
+import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core'
+import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy, arrayMove, useSortable } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import api from '../lib/api'
 import { imgUrl } from '../lib/img'
 import { useAuth } from '../context/AuthContext'
@@ -9,8 +12,49 @@ import { MangaDetailSkeleton } from '../components/Skeleton'
 import MetadataPickerModal from '../components/MetadataPickerModal'
 import CommentInput from '../components/CommentInput'
 
-interface Manga { id: string; title: string; otherTitles: string; description: string; author: string; status: string; genres: string; coverImageFileId: string; bannerImageFileId: string }
-interface Chapter { id: string; name: string; sortOrder: number; imageCount: number; chapterNumber?: string | null; chapterName?: string | null }
+interface Manga { id: string; title: string; otherTitles: string; description: string; author: string; status: string; genres: string; coverImageFileId: string; bannerImageFileId: string; isNSFW: boolean | null }
+interface Chapter { id: string; name: string; sortOrder: number; imageCount: number; chapterNumber?: string | null; chapterName?: string | null; slug?: string | null }
+// Shape of `unsynced` in the /import-chapters response.
+interface UnsyncedChapter { name: string | null; order: number }
+
+// Save `data` as a JSON file. The Blob URL is created here and revoked on the next
+// macrotask — never synchronously inside the click handler that triggers it, since
+// revoking (or unmounting the <a>) before the browser has started the download
+// cancels it outright and nothing is saved. Keeping the anchor detached also means
+// no React state has to stay alive just to hold a URL.
+function downloadJson(filename: string, data: unknown) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+// One draggable row inside the reorder modal. Manifest-backed chapters (slug set)
+// still drag freely in the UI, but the save call skips them server-side unless
+// "force" is checked — the lock icon signals that up front instead of letting the
+// admin drag a chapter and have it silently no-op.
+function SortableChapterRow({ chapter, index }: { chapter: Chapter; index: number }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: chapter.id })
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    display: 'flex', alignItems: 'center', padding: '10px 16px', gap: 10,
+    borderBottom: '1px solid var(--border)', background: isDragging ? 'var(--bg-hover)' : undefined,
+    opacity: isDragging ? 0.6 : 1,
+  }
+  return (
+    <div ref={setNodeRef} style={style}>
+      <span {...attributes} {...listeners} className="ms" style={{ fontSize: 18, color: 'var(--text-muted)', cursor: 'grab', touchAction: 'none' }}>drag_indicator</span>
+      <span style={{ fontSize: 12, color: 'var(--text-muted)', width: 24 }}>{index + 1}</span>
+      <span style={{ flex: 1, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{chapter.name}</span>
+      {chapter.slug && (
+        <span className="ms" title="Chapter có manifest — thứ tự sẽ tự sửa lại theo manifest khi sync, trừ khi tick Ghi đè" style={{ fontSize: 16, color: 'var(--text-muted)' }}>lock</span>
+      )}
+    </div>
+  )
+}
 interface ReactionCount { type: string; count: number }
 interface Comment { id: string; content: string; userName: string; avatarUrl: string; createdAt: string; parentCommentId: string | null; reactions: ReactionCount[]; userReactions: string[] }
 
@@ -119,13 +163,38 @@ export default function MangaDetail() {
   const [showFullDesc, setShowFullDesc] = useState(false)
   const [showComments, setShowComments] = useState(false)
   const [isFavorite, setIsFavorite] = useState(false)
+  const [showImportChapters, setShowImportChapters] = useState(false)
+  const [importChaptersJson, setImportChaptersJson] = useState('')
+  const [importChaptersLoading, setImportChaptersLoading] = useState(false)
+  // Bypasses the manifest-protection skip in import-chapters — only for one-time
+  // repairs when manifest.json itself has bad ordering (e.g. overlapping append
+  // batches). Defaults off so a normal import never silently overwrites manifest data.
+  const [importChaptersForce, setImportChaptersForce] = useState(false)
+  // Chapters from the last import that had no matching DB row (not yet synced
+  // from Drive) — offered as a downloadable JSON so the admin can sync those
+  // first, then re-import. Held as plain data, not a Blob URL: the URL is minted
+  // only inside the download click and revoked on the next macrotask, so closing
+  // this view discards the list without any URL lifetime to manage. There's no
+  // server-side temp file, this is purely client-side.
+  const [unsyncedResult, setUnsyncedResult] = useState<{ items: UnsyncedChapter[]; count: number } | null>(null)
   const [showReorder, setShowReorder] = useState(false)
   const [reorderList, setReorderList] = useState<Chapter[]>([])
-  const [showImportNames, setShowImportNames] = useState(false)
-  const [importJson, setImportJson] = useState('')
-  const [importLoading, setImportLoading] = useState(false)
+  const [reorderSaving, setReorderSaving] = useState(false)
+  // Same meaning as importChaptersForce: bypasses the manifest-protection skip
+  // server-side for manga whose manifest.json order needs a one-time manual fix.
+  const [reorderForce, setReorderForce] = useState(false)
   const [showMetadata, setShowMetadata] = useState(false)
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft] = useState('')
+  const [savingTitle, setSavingTitle] = useState(false)
   const [scrollTop, setScrollTop] = useState(0)
+  // Tracks which end of `chapters` (sorted by SortOrder desc) currently reads as
+  // "newest" — purely a label for the toggle button. Flipping it doesn't just
+  // change display: it persists a reversed SortOrder to the DB (see
+  // toggleChapterSortDir), since chapter order is global and must survive reload
+  // for every reader, not just a personal display preference.
+  const [chapterSortDir, setChapterSortDir] = useState<'desc' | 'asc'>('desc')
+  const [chapterSortLoading, setChapterSortLoading] = useState(false)
   const [replyTo, setReplyTo] = useState<Comment | null>(null)
   const { user } = useAuth()
   const connRef = useRef<signalR.HubConnection | null>(null)
@@ -153,6 +222,28 @@ export default function MangaDetail() {
   const toggleFav = async () => {
     const { data } = await api.post(`/favorites/${id}`)
     setIsFavorite(data.isFavorite)
+  }
+
+  const startEditTitle = () => {
+    setTitleDraft(manga!.title)
+    setEditingTitle(true)
+  }
+
+  const cancelEditTitle = () => setEditingTitle(false)
+
+  const saveTitle = async () => {
+    const next = titleDraft.trim()
+    if (!next || next === manga!.title) { setEditingTitle(false); return }
+    setSavingTitle(true)
+    try {
+      await api.patch(`/admin/mangas/${id}/title`, { title: next })
+      setManga(prev => prev ? { ...prev, title: next } : prev)
+      setEditingTitle(false)
+      message.success('Đã đổi tên manga')
+    } catch (err: any) {
+      message.error(err.response?.data?.message || 'Đổi tên thất bại')
+    }
+    setSavingTitle(false)
   }
 
   useEffect(() => {
@@ -195,6 +286,64 @@ export default function MangaDetail() {
 
   const onScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => setScrollTop(e.currentTarget.scrollTop), [])
 
+  // dnd-kit requires a small pointer-move threshold before a drag starts, otherwise
+  // a plain click/tap on a row would register as a (zero-distance) drag.
+  const reorderSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  )
+
+  const openReorder = () => { setReorderList([...chapters]); setShowReorder(true) }
+
+  const handleReorderDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+    setReorderList(prev => {
+      const oldIndex = prev.findIndex(c => c.id === active.id)
+      const newIndex = prev.findIndex(c => c.id === over.id)
+      return oldIndex === -1 || newIndex === -1 ? prev : arrayMove(prev, oldIndex, newIndex)
+    })
+  }
+
+  const saveReorder = async () => {
+    setReorderSaving(true)
+    try {
+      // reorderList is displayed newest-first (same convention as `chapters`), which
+      // is exactly what /reorder-chapters expects.
+      const { data } = await api.post(`/admin/mangas/${id}/reorder-chapters`, reorderList.map(c => c.id), { params: { force: reorderForce } })
+      setShowReorder(false)
+      setReorderForce(false)
+      const res = await api.get(`/mangas/${id}/chapters`)
+      setChapters(res.data.sort((a: Chapter, b: Chapter) => b.sortOrder - a.sortOrder))
+      message.success(`Đã cập nhật ${data.updated}/${data.total} chapter`
+        + (data.protectedByManifest > 0 ? `, ${data.protectedByManifest} chapter đã có manifest (không đổi)` : ''))
+    } catch (err: any) {
+      message.error(err.response?.data?.message || 'Sắp xếp thất bại')
+    }
+    setReorderSaving(false)
+  }
+
+  // Flips the whole chapter list's persisted SortOrder (Admin only — this is a
+  // global change, not a personal view preference). Reversing `chapters` client-side
+  // gives exactly the newest-first-by-new-direction id order reorder-chapters expects.
+  // force=true because most chapters here are manifest-backed (Slug set); without it
+  // the very next sync would silently revert the flip back to manifest order.
+  const toggleChapterSortDir = async () => {
+    const nextDir = chapterSortDir === 'desc' ? 'asc' : 'desc'
+    const reversedIds = [...chapters].reverse().map(c => c.id)
+    setChapterSortLoading(true)
+    try {
+      await api.post(`/admin/mangas/${id}/reorder-chapters`, reversedIds, { params: { force: true } })
+      setChapterSortDir(nextDir)
+      const res = await api.get(`/mangas/${id}/chapters`)
+      setChapters(res.data.sort((a: Chapter, b: Chapter) => b.sortOrder - a.sortOrder))
+      message.success('Đã đảo thứ tự chapter')
+    } catch (err: any) {
+      message.error(err.response?.data?.message || 'Đảo thứ tự thất bại')
+    }
+    setChapterSortLoading(false)
+  }
+
   if (!manga) return <MangaDetailSkeleton />
 
   const genres = (() => { try { return JSON.parse(manga.genres) as string[] } catch { return [] } })()
@@ -207,8 +356,12 @@ export default function MangaDetail() {
   })()
   const coverUrl = manga.coverImageFileId ? imgUrl(manga.coverImageFileId) : ''
   const bannerUrl = manga.bannerImageFileId ? imgUrl(manga.bannerImageFileId) : coverUrl
+  // toggleChapterSortDir persists the flip to the DB and refetches, so `chapters`
+  // is always already in the direction chapterSortDir describes — no client-side
+  // reversal needed here.
+  const displayChapters = chapters
   const startIdx = Math.max(0, Math.floor(scrollTop / ITEM_H) - 2)
-  const endIdx = Math.min(chapters.length, startIdx + 24)
+  const endIdx = Math.min(displayChapters.length, startIdx + 24)
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg-base)', display: 'flex', flexDirection: 'column' }}>
@@ -255,7 +408,36 @@ export default function MangaDetail() {
 
           {/* Title + Author + Buttons */}
           <div style={{ flex: 1, minWidth: 0, paddingBottom: 4 }}>
-            <h1 style={{ fontSize: 28, fontWeight: 700, lineHeight: 1.2, marginBottom: 6 }}>{manga.title}</h1>
+            {editingTitle ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <input
+                  autoFocus
+                  value={titleDraft}
+                  onChange={e => setTitleDraft(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') saveTitle(); if (e.key === 'Escape') cancelEditTitle() }}
+                  disabled={savingTitle}
+                  style={{ fontSize: 22, fontWeight: 700, lineHeight: 1.2, flex: 1, minWidth: 0, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--accent)', background: 'var(--bg-elevated)', color: 'var(--text)', outline: 'none' }}
+                />
+                <button onClick={saveTitle} disabled={savingTitle} title="Lưu"
+                  style={{ width: 32, height: 32, borderRadius: 6, border: 'none', background: 'var(--accent)', color: '#fff', cursor: savingTitle ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, opacity: savingTitle ? 0.6 : 1 }}>
+                  <span className="ms" style={{ fontSize: 18 }}>check</span>
+                </button>
+                <button onClick={cancelEditTitle} disabled={savingTitle} title="Hủy"
+                  style={{ width: 32, height: 32, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', cursor: savingTitle ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <span className="ms" style={{ fontSize: 18 }}>close</span>
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <h1 style={{ fontSize: 28, fontWeight: 700, lineHeight: 1.2, margin: 0, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{manga.title}</h1>
+                {user?.role === 'Admin' && (
+                  <button onClick={startEditTitle} title="Đổi tên manga"
+                    style={{ width: 28, height: 28, borderRadius: 6, border: 'none', background: 'none', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <span className="ms" style={{ fontSize: 18 }}>edit</span>
+                  </button>
+                )}
+              </div>
+            )}
             <p style={{ fontSize: 14, color: 'var(--text-secondary)', marginBottom: 12 }}>{manga.author || 'Unknown'}</p>
 
             {/* Action buttons */}
@@ -282,6 +464,9 @@ export default function MangaDetail() {
 
         {/* === GENRES + STATUS LINE === */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+          {manga.isNSFW === true && (
+            <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', color: '#fff', padding: '3px 8px', background: 'var(--red, #e5484d)', borderRadius: 4 }}>NSFW</span>
+          )}
           {genres.map(g => (
             <span key={g} style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', color: 'var(--text-secondary)', padding: '3px 8px', background: 'var(--bg-hover)', borderRadius: 4 }}>{g}</span>
           ))}
@@ -349,21 +534,41 @@ export default function MangaDetail() {
             <span className="ms ms-sm" style={{ color: 'var(--accent)' }}>format_list_numbered</span>
             <h2 style={{ fontSize: 15, fontWeight: 600 }}>Chapters ({chapters.length})</h2>
             {user?.role === 'Admin' && (
-              <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-                <button onClick={() => setShowImportNames(true)}
-                  style={{ background: 'none', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 10px', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <span className="ms" style={{ fontSize: 16 }}>upload</span>Import tên
-                </button>
-                <button onClick={() => { setReorderList([...chapters]); setShowReorder(true) }}
-                  style={{ background: 'none', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 10px', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <span className="ms" style={{ fontSize: 16 }}>swap_vert</span>Sắp xếp
-                </button>
+              <div style={{ marginLeft: 'auto' }}>
+                <Dropdown trigger={['click']} placement="bottomRight" menu={{
+                  items: [
+                    {
+                      key: 'sortDir',
+                      icon: <span className={chapterSortLoading ? 'ms spin' : 'ms'} style={{ fontSize: 16 }}>{chapterSortLoading ? 'progress_activity' : (chapterSortDir === 'desc' ? 'arrow_downward' : 'arrow_upward')}</span>,
+                      label: chapterSortDir === 'desc' ? 'Đảo thành: Cũ nhất trước' : 'Đảo thành: Mới nhất trước',
+                      disabled: chapterSortLoading,
+                      onClick: toggleChapterSortDir,
+                    },
+                    {
+                      key: 'reorder',
+                      icon: <span className="ms" style={{ fontSize: 16 }}>swap_vert</span>,
+                      label: 'Sắp xếp (kéo thả)',
+                      onClick: openReorder,
+                    },
+                    {
+                      key: 'import',
+                      icon: <span className="ms" style={{ fontSize: 16 }}>upload</span>,
+                      label: 'Import chapter',
+                      onClick: () => setShowImportChapters(true),
+                    },
+                  ],
+                }}>
+                  <button
+                    style={{ background: 'none', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 10px', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span className="ms" style={{ fontSize: 16 }}>settings</span>Quản lý chapter
+                  </button>
+                </Dropdown>
               </div>
             )}
           </div>
 
           {/* Desktop: virtual scroll */}
-          {chapters.length === 0 ? (
+          {displayChapters.length === 0 ? (
             <div style={{ padding: '40px 20px', textAlign: 'center', borderRadius: 12, border: '1px solid var(--border)', background: 'var(--bg-elevated)' }}>
               <span className="ms" style={{ fontSize: 40, color: 'var(--text-muted)', display: 'block', marginBottom: 8 }}>menu_book</span>
               <p style={{ color: 'var(--text-muted)', fontSize: 14 }}>Chưa có chapter nào</p>
@@ -371,14 +576,12 @@ export default function MangaDetail() {
           ) : (
           <>
           <div className="desktop-only" onScroll={onScroll} style={{ maxHeight: 700, overflowY: 'auto', borderRadius: 12, border: '1px solid var(--border)', background: 'var(--bg-elevated)' }}>
-            <div style={{ height: chapters.length * ITEM_H, position: 'relative' }}>
-              {chapters.slice(startIdx, endIdx).map((c, i) => (
+            <div style={{ height: displayChapters.length * ITEM_H, position: 'relative' }}>
+              {displayChapters.slice(startIdx, endIdx).map((c, i) => (
                 <Link key={c.id} to={`/chapter/${c.id}`} style={{ position: 'absolute', top: (startIdx + i) * ITEM_H, left: 0, right: 0, height: ITEM_H, display: 'flex', alignItems: 'center', padding: '0 14px', gap: 10, borderBottom: '1px solid var(--border)' }}>
                   <span className="ms" style={{ fontSize: 18, color: 'var(--text-muted)' }}>bookmark</span>
                   <span style={{ flex: 1, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {c.chapterNumber
-                      ? `Chương ${c.chapterNumber}${c.chapterName ? ` - ${c.chapterName}` : ''}`
-                      : c.name}
+                    {c.name}
                   </span>
                   <span style={{ fontSize: 12, color: 'var(--text-muted)', flexShrink: 0 }}>{c.imageCount}p</span>
                   <span className="ms" style={{ fontSize: 18, color: 'var(--text-muted)' }}>chevron_right</span>
@@ -389,14 +592,12 @@ export default function MangaDetail() {
 
           {/* Mobile: virtual scroll */}
           <div className="mobile-only" onScroll={onScroll} style={{ maxHeight: 600, overflowY: 'auto', borderRadius: 12, border: '1px solid var(--border)', background: 'var(--bg-elevated)' }}>
-            <div style={{ height: chapters.length * ITEM_H, position: 'relative' }}>
-              {chapters.slice(startIdx, endIdx).map((c, i) => (
+            <div style={{ height: displayChapters.length * ITEM_H, position: 'relative' }}>
+              {displayChapters.slice(startIdx, endIdx).map((c, i) => (
                 <Link key={c.id} to={`/chapter/${c.id}`} style={{ position: 'absolute', top: (startIdx + i) * ITEM_H, left: 0, right: 0, height: ITEM_H, display: 'flex', alignItems: 'center', padding: '0 14px', gap: 10, borderBottom: '1px solid var(--border)' }}>
                   <span className="ms" style={{ fontSize: 18, color: 'var(--text-muted)' }}>bookmark</span>
                   <span style={{ flex: 1, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {c.chapterNumber
-                      ? `Chương ${c.chapterNumber}${c.chapterName ? ` - ${c.chapterName}` : ''}`
-                      : c.name}
+                    {c.name}
                   </span>
                   <span style={{ fontSize: 12, color: 'var(--text-muted)', flexShrink: 0 }}>{c.imageCount}p</span>
                   <span className="ms" style={{ fontSize: 18, color: 'var(--text-muted)' }}>chevron_right</span>
@@ -516,33 +717,19 @@ export default function MangaDetail() {
         </div>
       )}
 
-      {/* Reorder modal (Admin) */}
-      <Modal open={showReorder} onCancel={() => setShowReorder(false)} title="Kéo thả để sắp xếp" centered
-        onOk={async () => { await api.post(`/admin/mangas/${id}/reorder-chapters`, reorderList.map(c => c.id)); setChapters([...reorderList]); setShowReorder(false) }}
-        okText="Lưu" cancelText="Hủy" styles={{ body: { maxHeight: '60vh', overflowY: 'auto', padding: '4px 0' } }}>
-        {reorderList.map((c, idx) => (
-          <div key={c.id} draggable
-            onDragStart={e => e.dataTransfer.setData('idx', String(idx))}
-            onDragOver={e => e.preventDefault()}
-            onDrop={e => { const from = Number(e.dataTransfer.getData('idx')); const arr = [...reorderList]; const [item] = arr.splice(from, 1); arr.splice(idx, 0, item); setReorderList(arr) }}
-            style={{ display: 'flex', alignItems: 'center', padding: '10px 16px', gap: 10, cursor: 'grab', borderBottom: '1px solid var(--border)', transition: 'background 0.15s' }}
-            onDragEnter={e => (e.currentTarget.style.background = 'var(--bg-hover)')}
-            onDragLeave={e => (e.currentTarget.style.background = '')}
-            onDragEnd={e => (e.currentTarget.style.background = '')}>
-            <span className="ms" style={{ fontSize: 18, color: 'var(--text-muted)' }}>drag_indicator</span>
-            <span style={{ fontSize: 12, color: 'var(--text-muted)', width: 20 }}>{idx + 1}</span>
-            <span style={{ flex: 1, fontSize: 14 }}>{c.name}</span>
-          </div>
-        ))}
-      </Modal>
-
-      {/* Import chapter names modal (Admin) */}
-      <Modal open={showImportNames} onCancel={() => { setShowImportNames(false); setImportJson('') }} title="Import tên chapter" centered
+      {/* Import chapters modal (Admin) — one list gives both order and name;
+          matching entirely replaces the old manual drag-and-drop "Sắp xếp" step. */}
+      <Modal open={showImportChapters} onCancel={() => { setShowImportChapters(false); setImportChaptersJson(''); setImportChaptersForce(false) }} title="Import chapter" centered
         footer={null} destroyOnClose styles={{ body: { maxHeight: '70vh', display: 'flex', flexDirection: 'column', gap: 12 } }}>
         <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 8 }}>
-          Paste JSON với format: <code>[{`{ "label": "Ch.1 — Tên chapter" }`}]</code><br />
-          Hoặc upload file .json. Số chapter trong label sẽ match với chapter hiện tại.
+          Paste JSON với format: <code>[{`{ "order": 1, "name": "Chương 881: Trở về" }`}]</code><br />
+          Hoặc upload file .json. <code>name</code> phải khớp chính xác tên chapter hiện tại, <code>order</code> = 1 là chapter mới nhất. Tên chapter hiển thị và thứ tự sẽ được cập nhật cùng lúc.
+          Chapter đã được scramble (có manifest) sẽ giữ tên/thứ tự lấy từ manifest và bị bỏ qua ở đây, trừ khi tick "Ghi đè" bên dưới.
         </p>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4, cursor: 'pointer' }}>
+          <input type="checkbox" checked={importChaptersForce} onChange={e => setImportChaptersForce(e.target.checked)} />
+          Ghi đè cả chapter đã có manifest (chỉ dùng khi manifest.json bị sai thứ tự — sync lần sau sẽ KHÔNG tự sửa lại nếu manifest gốc chưa được sửa)
+        </label>
         <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
           <label style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }}>
             <span className="ms" style={{ fontSize: 16 }}>upload_file</span>Chọn file
@@ -550,24 +737,24 @@ export default function MangaDetail() {
               const file = e.target.files?.[0]
               if (file) {
                 const reader = new FileReader()
-                reader.onload = ev => setImportJson(ev.target?.result as string || '')
+                reader.onload = ev => setImportChaptersJson(ev.target?.result as string || '')
                 reader.readAsText(file)
               }
             }} />
           </label>
-          {importJson && <span style={{ fontSize: 12, color: 'var(--green)', display: 'flex', alignItems: 'center', gap: 4 }}><span className="ms" style={{ fontSize: 14 }}>check_circle</span>Đã load</span>}
+          {importChaptersJson && <span style={{ fontSize: 12, color: 'var(--green)', display: 'flex', alignItems: 'center', gap: 4 }}><span className="ms" style={{ fontSize: 14 }}>check_circle</span>Đã load</span>}
         </div>
         <textarea
-          value={importJson}
-          onChange={e => setImportJson(e.target.value)}
-          placeholder='[{ "label": "Ch.1 — Tên chapter" }, ...]'
+          value={importChaptersJson}
+          onChange={e => setImportChaptersJson(e.target.value)}
+          placeholder='[{ "order": 1, "name": "Chương 881: Trở về" }, ...]'
           style={{ width: '100%', minHeight: 180, flex: 1, padding: '10px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-base)', color: 'var(--text)', fontSize: 12, fontFamily: 'monospace', outline: 'none', resize: 'vertical' }}
           onFocus={e => e.currentTarget.style.borderColor = 'var(--accent)'}
           onBlur={e => e.currentTarget.style.borderColor = 'var(--border)'}
         />
-        {importJson && (() => {
+        {importChaptersJson && (() => {
           try {
-            const parsed = JSON.parse(importJson)
+            const parsed = JSON.parse(importChaptersJson)
             const items = Array.isArray(parsed) ? parsed : []
             return <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Tìm thấy {items.length} mục</p>
           } catch {
@@ -575,29 +762,80 @@ export default function MangaDetail() {
           }
         })()}
         <button
-          disabled={importLoading || !importJson.trim()}
+          disabled={importChaptersLoading || !importChaptersJson.trim()}
           onClick={async () => {
             try {
-              const parsed = JSON.parse(importJson)
-              const items = (Array.isArray(parsed) ? parsed : []).map((item: any) => ({ label: item.label || item.name || '' })).filter((i: any) => i.label)
+              const parsed = JSON.parse(importChaptersJson)
+              const items = (Array.isArray(parsed) ? parsed : [])
+                .map((item: any) => ({ name: item.name || '', order: Number(item.order) }))
+                .filter((i: any) => i.name && Number.isFinite(i.order))
               if (items.length === 0) return
-              setImportLoading(true)
-              const { data } = await api.post(`/admin/mangas/${id}/import-chapter-names`, items)
-              setShowImportNames(false)
-              setImportJson('')
+              setImportChaptersLoading(true)
+              const { data } = await api.post(`/admin/mangas/${id}/import-chapters`, items, { params: { force: importChaptersForce } })
+              setShowImportChapters(false)
+              setImportChaptersJson('')
+              setImportChaptersForce(false)
               // Reload chapters
               const res = await api.get(`/mangas/${id}/chapters`)
               setChapters(res.data.sort((a: Chapter, b: Chapter) => b.sortOrder - a.sortOrder))
-              alert(`Đã cập nhật ${data.updated}/${data.total} chapter` + (data.skipped > 0 ? ` (${data.skipped} không match)` : ''))
+              alert(`Đã cập nhật ${data.updated}/${data.total} chapter`
+                + (data.protectedByManifest > 0 ? `, ${data.protectedByManifest} chapter đã có metadata từ manifest (không đổi)` : '')
+                + (data.skipped > 0 ? `, ${data.skipped} không khớp tên` : ''))
+              // Chapters the pasted list references but that have no matching DB
+              // row yet (not synced from Drive) — offer them as a downloadable
+              // JSON so the admin can sync those first, then re-import.
+              if (data.unsynced?.length > 0) {
+                setUnsyncedResult({ items: data.unsynced, count: data.unsynced.length })
+              }
             } catch (err: any) {
               alert(err.response?.data?.message || 'Lỗi import')
             }
-            setImportLoading(false)
+            setImportChaptersLoading(false)
           }}
-          style={{ padding: '10px 0', borderRadius: 8, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: importLoading ? 'not-allowed' : 'pointer', opacity: (importLoading || !importJson.trim()) ? 0.6 : 1 }}
+          style={{ padding: '10px 0', borderRadius: 8, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: importChaptersLoading ? 'not-allowed' : 'pointer', opacity: (importChaptersLoading || !importChaptersJson.trim()) ? 0.6 : 1 }}
         >
-          {importLoading ? 'Đang import...' : 'Import'}
+          {importChaptersLoading ? 'Đang import...' : 'Import'}
         </button>
+      </Modal>
+
+      {/* Unsynced-chapters result (Admin) — shown after Import when the pasted list
+          references chapters not yet in the DB. The list only exists client-side;
+          closing this modal discards it, which is the closest equivalent to
+          "auto-delete" for a file that was never staged server-side. */}
+      <Modal open={!!unsyncedResult} onCancel={() => setUnsyncedResult(null)}
+        title="Chapter chưa đồng bộ" centered footer={null} destroyOnClose>
+        <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>
+          {unsyncedResult?.count} chapter trong danh sách import chưa có trong DB (chưa được sync từ Drive), nên không thể cập nhật tên/thứ tự. Sync các chapter này trước, sau đó import lại.
+        </p>
+        <button
+          onClick={() => {
+            // Download first, then close — downloadJson defers its own cleanup, so
+            // clearing state here doesn't cancel the in-flight save.
+            if (unsyncedResult) downloadJson(`unsynced-chapters-${id}.json`, unsyncedResult.items)
+            setUnsyncedResult(null)
+          }}
+          style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, padding: '10px 0', borderRadius: 8, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}
+        >
+          <span className="ms" style={{ fontSize: 16 }}>download</span>Tải file JSON
+        </button>
+      </Modal>
+
+      {/* Reorder modal (Admin) — drag-and-drop via dnd-kit; manifest-backed chapters
+          (lock icon) are protected server-side unless "Ghi đè" is checked. */}
+      <Modal open={showReorder} onCancel={() => { setShowReorder(false); setReorderForce(false) }} title="Kéo thả để sắp xếp" centered
+        onOk={saveReorder} okText="Lưu" okButtonProps={{ loading: reorderSaving }} cancelText="Hủy"
+        styles={{ body: { maxHeight: '60vh', overflowY: 'auto', padding: '4px 0' } }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-secondary)', margin: '0 16px 8px', cursor: 'pointer' }}>
+          <input type="checkbox" checked={reorderForce} onChange={e => setReorderForce(e.target.checked)} />
+          Ghi đè cả chapter đã có manifest (khóa) — sync lần sau sẽ KHÔNG tự sửa lại nếu manifest gốc chưa được sửa
+        </label>
+        <DndContext sensors={reorderSensors} collisionDetection={closestCenter} onDragEnd={handleReorderDragEnd}>
+          <SortableContext items={reorderList.map(c => c.id)} strategy={verticalListSortingStrategy}>
+            {reorderList.map((c, idx) => (
+              <SortableChapterRow key={c.id} chapter={c} index={idx} />
+            ))}
+          </SortableContext>
+        </DndContext>
       </Modal>
 
       {/* Metadata picker (Admin) */}
